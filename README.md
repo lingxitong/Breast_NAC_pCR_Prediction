@@ -2,24 +2,36 @@
 
 乳腺新辅助治疗 **pCR 二分类**预测（参考 `BreastRCB-Prognosis` 的 MIL + 临床中期融合框架）。
 
-入口脚本：[`main_pcr.py`](main_pcr.py)  
-示例数据：[`example_dataset.csv`](example_dataset.csv)  
-字段说明：[`Feature_dict.json`](Feature_dict.json)
+| 文件 | 说明 |
+| --- | --- |
+| [`main_pcr.py`](main_pcr.py) | 训练 / 推理入口 |
+| [`make_kfold_splits.py`](make_kfold_splits.py) | 独立 K 折划分 |
+| [`example_dataset.csv`](example_dataset.csv) | 示例数据 |
+| [`Feature_dict.json`](Feature_dict.json) | 字段说明 |
 
 核心逻辑：
-- **标签**：`N-pCR → 0`，`pCR → 1`（CSV 也可直接写 `0/1`）
-- **损失**：CrossEntropy
-- **指标**：AUC / Accuracy / F1 / Sensitivity / Specificity；K 折按 **val AUC** 选模
-- **多 slide 拼 bag**：同一 `case_id` 可有多张 slide；训练时拼接，超过 `max_slides_train` 则随机抽取；推理拼接全部
-- **临床中期融合**（默认开启）
-  - 因子变量（one-hot）：`Molecular, T, N, HER2`
-  - 连续变量（标准化）：`Age, ER, PR, Ki67`
-  - Molecular 四种：`HR+HER2-` / `HR+HER2+` / `TNBC` / `HER2`
-- **K 折分层**：`--stratify_by`（默认 `Molecular_label`）；划分写入 `kfold_splits.yaml`；超参写入 `config.yaml`
+- **标签**：`N-pCR → 0`，`pCR → 1`
+- **模态**：`pathomic`（病理+临床，默认）/ `pathology`（仅病理）/ `clinical`（仅临床）
+- **K 折**：必须先用 `make_kfold_splits.py` 划分；训练强制 `--splits_path` 加载，`main_pcr.py` 不做现场划分
+- **临床编码**：因子 `Molecular,T,N,HER2` one-hot；连续 `Age,ER,PR,Ki67` 标准化  
+  Molecular 四种：`HR+HER2-` / `HR+HER2+` / `TNBC` / `HER2`
 
 ```bash
+# 1) 划分
+python make_kfold_splits.py --csv_path example_dataset.csv \
+    --out_dir ./splits/mol_label_k5 --k 5 --stratify_by Molecular_label
+
+# 2) 基于划分训练（多模态）
 python main_pcr.py --mode train --split_mode kfold \
-    --csv_path example_dataset.csv --log_root ./logs --exp_name pcr_kfold
+    --csv_path example_dataset.csv \
+    --splits_path ./splits/mol_label_k5 \
+    --log_root ./logs --exp_name pcr_kfold
+
+# 3) 仅临床信息
+python main_pcr.py --mode train --split_mode kfold --clinical_only \
+    --csv_path example_dataset.csv \
+    --splits_path ./splits/mol_label_k5 \
+    --log_root ./logs --exp_name pcr_clinical
 ```
 
 ---
@@ -32,60 +44,109 @@ python main_pcr.py --mode train --split_mode kfold \
 
 | 列名 | 说明 |
 | --- | --- |
-| `case_id` | 患者 ID（同一患者多张 slide 共用） |
+| `case_id` | 患者 ID |
 | `slide_id` | 切片 ID |
-| `slide_feats_path` | 该切片特征文件路径（`.pt` 或 `.h5`） |
+| `slide_feats_path` | 切片特征路径（`.pt` / `.h5`）；**仅临床模式可不依赖特征文件存在** |
 | `label` | `N-pCR` / `pCR`，或 `0` / `1` |
 
-### 临床列（白名单，可选但推荐）
+### 临床列
 
 | 列名 | 类型 | 编码 | 说明 |
 | --- | --- | --- | --- |
-| `Molecular` | 因子 | one-hot | 分子分型：`HR+HER2-` / `HR+HER2+` / `TNBC` / `HER2` |
-| `T` | 因子 | one-hot | 临床 T 分期 |
-| `N` | 因子 | one-hot | 临床 N 分期 |
-| `HER2` | 因子 | one-hot | HER2 IHC 等级（与 Molecular 取值 `HER2` 含义不同） |
-| `Age` | 连续 | 标准化 | 年龄 |
-| `ER` | 连续 | 标准化 | ER 表达 |
-| `PR` | 连续 | 标准化 | PR 表达 |
-| `Ki67` | 连续 | 标准化 | Ki67 指数 |
-
-因子变量按训练折类别表 one-hot（含 `missing`）；连续变量用训练集均值/标准差做 z-score。`Molecular` 预置四类，即使某折未出现也保留维度。
-
-特征文件：
-- `.pt`：`Tensor` / `ndarray`，形状 `[N_patch, dim]`；或含 `features` 键的 dict
-- `.h5`：默认键名 `features`（可用 `--feat_key` 修改）
+| `Molecular` | 因子 | one-hot | `HR+HER2-` / `HR+HER2+` / `TNBC` / `HER2` |
+| `T` / `N` / `HER2` | 因子 | one-hot | 分期 / IHC（列名 `HER2` ≠ Molecular 取值 `HER2`） |
+| `Age` / `ER` / `PR` / `Ki67` | 连续 | 标准化 | 年龄与免疫组化 |
 
 ---
 
-## 二、模型结构（中期融合）
-
-```
-slide bag [N, in_dim]
-    ↓
-MIL 聚合器 (abmil / mean_mil / max_mil)
-    ↓
-全局表征 [1, hidden_dim]
-    ↓                          临床向量 [clinical_in_dim]
-    ↓                                ↓
-    └──────── fusion_type ──── 临床 MLP → 临床嵌入
-                    ↓
-              融合表征 [1, hidden_dim]
-                    ↓
-              分类头 → logits [2]
-```
-
-`--fusion_type`：`concat`（默认）/ `bilinear` / `gated`  
-关闭临床融合：`--no-use_clinical`
-
----
-
-## 三、常用命令
+## 二、K 折划分（独立脚本）
 
 ```bash
-# K 折交叉验证
+python make_kfold_splits.py \
+    --csv_path example_dataset.csv \
+    --out_dir ./splits/mol_label_k5 \
+    --k 5 --seed 1 --stratify_by Molecular_label
+```
+
+输出：
+
+```
+splits/mol_label_k5/
+  kfold_splits.yaml / .json
+  split_config.yaml / config.yaml
+  fold_0/split.yaml, train_case_ids.txt, val_case_ids.txt
+  fold_1/ ...
+```
+
+训练时：
+
+```bash
 python main_pcr.py --mode train --split_mode kfold \
-    --csv_path example_dataset.csv --log_root ./logs --exp_name pcr_kfold
+    --csv_path example_dataset.csv \
+    --splits_path ./splits/mol_label_k5/kfold_splits.yaml \
+    ...
+```
+
+`--splits_path` 也可直接给划分目录。**kfold 训练时该参数必填**；未提供将直接报错。
+
+### `make_kfold_splits.py --stratify_by`
+
+| 取值 | 含义 |
+| --- | --- |
+| `Molecular_label`（默认） | Molecular × label 联合分层 |
+| `Molecular` | 仅分子分型 |
+| `label` | 仅结局 |
+| `none` | 不分层 |
+
+失败时按 `Molecular_label → Molecular → label → none` 回退。
+
+---
+
+## 三、模态与模型
+
+| `--modality` | 别名 | 说明 |
+| --- | --- | --- |
+| `pathomic` | 默认 | WSI MIL + 临床中期融合 |
+| `pathology` | `--no-use_clinical` | 仅病理 |
+| `clinical` | `--clinical_only` | 仅临床 MLP，不加载 WSI |
+
+**pathomic：**
+
+```
+slide bag → MIL → 全局表征 ─┐
+临床向量 → MLP → 临床嵌入 ─┴→ fusion → 分类头
+```
+
+**clinical：**
+
+```
+临床向量 → MLP → logits
+```
+
+`--fusion_type`：`concat` / `bilinear` / `gated`（仅 pathomic）
+
+---
+
+## 四、常用命令
+
+```bash
+# 基于预划分的多模态 K 折
+python main_pcr.py --mode train --split_mode kfold \
+    --csv_path example_dataset.csv \
+    --splits_path ./splits/mol_label_k5 \
+    --log_root ./logs --exp_name pcr_kfold
+
+# 仅临床
+python main_pcr.py --mode train --split_mode kfold --clinical_only \
+    --csv_path example_dataset.csv \
+    --splits_path ./splits/mol_label_k5 \
+    --log_root ./logs --exp_name pcr_clinical
+
+# 仅病理
+python main_pcr.py --mode train --split_mode kfold --modality pathology \
+    --csv_path example_dataset.csv \
+    --splits_path ./splits/mol_label_k5 \
+    --log_root ./logs --exp_name pcr_path
 
 # 全量训练
 python main_pcr.py --mode train --split_mode all_train \
@@ -100,65 +161,51 @@ python main_pcr.py --mode infer \
 
 ---
 
-## 四、主要超参数
+## 五、主要超参数
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--mode` | `train` | `train` / `infer` |
+| `--modality` | `pathomic` | `pathomic` / `pathology` / `clinical` |
+| `--clinical_only` | 关 | 等价 `--modality clinical` |
+| `--splits_path` | 无（kfold 必填） | 预划分 yaml/json 或目录 |
 | `--split_mode` | `kfold` | `kfold` / `all_train` |
-| `--k` | `5` | 折数（按 case） |
-| `--stratify_by` | `Molecular_label` | `Molecular_label` / `Molecular` / `label` / `none` |
+| `--k` | 以划分文件为准 | 训练侧兼容字段 |
 | `--model_type` | `abmil` | `abmil` / `mean_mil` / `max_mil` |
 | `--fusion_type` | `concat` | 中期融合方式 |
-| `--use_clinical` | 开启 | `--no-use_clinical` 关闭 |
 | `--max_epochs` | `50` | 训练轮数 |
 | `--lr` | `1e-4` | 学习率 |
-| `--gc` | `16` | 梯度累积步数 |
+| `--gc` | `16` | 梯度累积 |
 | `--max_slides_train` | `3` | 训练时最多拼接 slide 数 |
-| `--in_dim` | `-1` | `<=0` 时从特征文件自动推断 |
-
-### `--stratify_by`
-
-| 取值 | 含义 |
-| --- | --- |
-| `Molecular_label`（默认） | Molecular 与 label 联合分层（`Molecular\|y{0/1}`） |
-| `Molecular` | 仅分子分型 |
-| `label` | 仅 pCR / N-pCR |
-| `none` | 不分层，随机 KFold |
-
-失败时按 `Molecular_label → Molecular → label → none` 回退。日志中 `stratify_by_requested` 为请求值，`stratify_by` 为实际值。
 
 ---
 
-## 五、输出与日志
+## 六、输出与日志
 
 ### 训练（kfold）
 
 ```
 logs/exp_name/
-  config.yaml / config.json
-  kfold_splits.yaml / .json
-  kfold_summary.yaml / .json
+  config.yaml                 # 含 modality / splits_path / stratify_by
+  kfold_splits.yaml           # 本实验使用的划分副本
+  kfold_summary.yaml
   fold_0/
     split.yaml
-    train_case_ids.txt / val_case_ids.txt
-    checkpoint_best.pt      # 按 val AUC
-    checkpoint_last.pt
-    clinical_encoder.json
-    metrics.csv / history.json
-  fold_1/ ...
+    checkpoint_best.pt
+    clinical_encoder.json     # pathomic / clinical
+    metrics.csv
+  ...
 ```
 
 ### 推理
 
 ```
 infer_dir/
-  predictions.csv   # case_id, label, prob_pCR, pred
+  predictions.csv
   metrics.json
 ```
 
 ---
 
-## 六、依赖
+## 七、依赖
 
 `torch`, `numpy`, `pandas`, `scikit-learn`, `h5py`, `PyYAML`

@@ -22,21 +22,38 @@ slide_feats_path 指向每张 slide 的特征文件（.pt 或 .h5）。
   连续变量（标准化）：Age, ER, PR, Ki67
 Molecular 取值（四种）：HR+HER2- / HR+HER2+ / TNBC / HER2。
 
-支持三种运行模式（--mode）:
+支持运行模式（--mode）:
   train  : 训练。--split_mode 控制 kfold（默认）或 all_train。
   infer  : 推理。给定超参 yaml/json + 权重 + csv，输出指标和每个患者的预测概率。
 
-K 折划分：由 --stratify_by 指定分层依据（默认 Molecular_label，即
-  label 与 Molecular 联合分层）；划分结果写入日志
-  （kfold_splits.yaml 与各 fold_*/split.yaml）。
+模态（--modality）:
+  pathomic  : WSI MIL + 临床中期融合（默认）
+  pathology : 仅病理 WSI
+  clinical  : 仅临床信息（不加载 slide 特征）；也可用 --clinical_only
+
+K 折划分：
+  * 必须先用独立脚本 make_kfold_splits.py 生成划分；
+  * 训练（split_mode=kfold）强制通过 --splits_path 加载预划分，
+    main_pcr.py 内不再做现场/临时划分。
+
 超参数：训练时以 config.yaml 写入日志目录；推理 --config 支持 yaml/json。
 
 示例（在项目根目录执行）：
-  python main_pcr.py --mode train --split_mode kfold \\
-      --csv_path example_dataset.csv --log_root ./logs --exp_name pcr_kfold
+  # 1) 先划分（唯一划分入口）
+  python make_kfold_splits.py --csv_path example_dataset.csv \\
+      --out_dir ./splits/mol_label_k5 --k 5 --stratify_by Molecular_label
 
-  python main_pcr.py --mode train --split_mode all_train \\
-      --csv_path example_dataset.csv --log_root ./logs --exp_name pcr_all
+  # 2) 基于预划分训练（病理+临床）；必须提供 --splits_path
+  python main_pcr.py --mode train --split_mode kfold \\
+      --csv_path example_dataset.csv \\
+      --splits_path ./splits/mol_label_k5/kfold_splits.yaml \\
+      --log_root ./logs --exp_name pcr_kfold
+
+  # 3) 仅临床信息训练
+  python main_pcr.py --mode train --split_mode kfold --clinical_only \\
+      --csv_path example_dataset.csv \\
+      --splits_path ./splits/mol_label_k5/kfold_splits.yaml \\
+      --log_root ./logs --exp_name pcr_clinical_only
 
   python main_pcr.py --mode infer --config ./logs/pcr_kfold/config.yaml \\
       --ckpt_path ./logs/pcr_kfold/fold_0/checkpoint_best.pt \\
@@ -132,16 +149,20 @@ def load_config_file(path):
 # 超参数 / 列约定
 # ----------------------------------------------------------------------------
 HPARAM_KEYS = [
-    "k", "split_mode", "stratify_by", "n_classes", "max_epochs", "lr", "reg",
+    "k", "split_mode", "stratify_by", "splits_path", "n_classes",
+    "max_epochs", "lr", "reg",
     "drop_out", "gc", "seed", "opt", "model_type", "in_dim",
     "hidden_dim", "max_slides_train", "feat_key", "num_workers",
     "mambamil_layer", "mambamil_rate", "mambamil_type",
-    "use_clinical", "fusion_type", "clinical_hidden_dim", "clinical_in_dim",
+    "modality", "clinical_only", "use_clinical",
+    "fusion_type", "clinical_hidden_dim", "clinical_in_dim",
     "label_col", "feat_path_col",
 ]
 
 # K 折分层依据（写入 config.yaml / kfold_splits.yaml 的 stratify_by）
 STRATIFY_BY_CHOICES = ("Molecular_label", "Molecular", "label", "none")
+# 输入模态
+MODALITY_CHOICES = ("pathomic", "pathology", "clinical")
 
 # 标识 / 路径 / 标签列（禁止作为临床特征）
 META_COLS = {
@@ -356,6 +377,65 @@ class PathomicClassificationModel(nn.Module):
         return logits
 
 
+class ClinicalOnlyModel(nn.Module):
+    """仅临床信息的 MLP 二分类器（不使用 WSI 特征）。"""
+
+    def __init__(self, clinical_in_dim, n_classes, hidden_dim=256, dropout=0.25):
+        super().__init__()
+        if clinical_in_dim <= 0:
+            raise ValueError("ClinicalOnlyModel 需要 clinical_in_dim > 0")
+        h = max(32, int(hidden_dim) // 2)
+        self.net = nn.Sequential(
+            nn.Linear(clinical_in_dim, h),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h, h),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h, n_classes),
+        )
+        self.apply(_init_weights)
+
+    def forward(self, x=None, clinical=None):
+        if clinical is None:
+            raise ValueError("clinical_only 模式必须提供 clinical 特征")
+        clin = clinical.unsqueeze(0) if clinical.dim() == 1 else clinical
+        return self.net(clin)
+
+
+def normalize_modality(cfg):
+    """
+    统一解析 modality / clinical_only / use_clinical。
+    返回规范化后的 modality，并写回 cfg。
+    """
+    modality = cfg.get("modality", None)
+    clinical_only = bool(cfg.get("clinical_only", False))
+    use_clinical = cfg.get("use_clinical", True)
+
+    if clinical_only:
+        modality = "clinical"
+    if modality is None or str(modality).strip() == "":
+        modality = "pathomic" if use_clinical else "pathology"
+    modality = str(modality).strip().lower()
+    aliases = {
+        "clin": "clinical",
+        "clinical_only": "clinical",
+        "path": "pathology",
+        "wsi": "pathology",
+        "fusion": "pathomic",
+        "multi": "pathomic",
+        "multimodal": "pathomic",
+    }
+    modality = aliases.get(modality, modality)
+    if modality not in MODALITY_CHOICES:
+        raise ValueError(f"未知 modality={modality!r}，可选: {list(MODALITY_CHOICES)}")
+
+    cfg["modality"] = modality
+    cfg["clinical_only"] = modality == "clinical"
+    cfg["use_clinical"] = modality in ("pathomic", "clinical")
+    return modality
+
+
 def build_backbone(cfg):
     mt = cfg["model_type"]
     if mt == "abmil":
@@ -367,22 +447,35 @@ def build_backbone(cfg):
         return MeanMaxBackbone(cfg["in_dim"], dropout=cfg["drop_out"],
                                hidden=cfg["hidden_dim"], pool="max")
     if mt in ("mamba_mil", "trans_mil", "s4model"):
-        if cfg.get("use_clinical", True):
+        if cfg.get("use_clinical", True) or cfg.get("clinical_only", False):
             raise NotImplementedError(
-                f"临床中期融合暂不支持 model_type={mt}，请使用 abmil/mean_mil/max_mil，"
-                f"或设置 use_clinical=false"
+                f"临床融合/仅临床模式暂不支持 model_type={mt}，请使用 abmil/mean_mil/max_mil，"
+                f"或设置 --modality pathology"
             )
         return _build_repo_model(cfg)
     raise NotImplementedError(f"未知 model_type: {mt}")
 
 
 def build_model(cfg, device):
-    if cfg["model_type"] in ("mamba_mil", "trans_mil", "s4model") and not cfg.get("use_clinical", True):
+    modality = normalize_modality(cfg)
+    clinical_in_dim = int(cfg.get("clinical_in_dim", 0) or 0)
+
+    if modality == "clinical":
+        if clinical_in_dim <= 0:
+            raise ValueError("modality=clinical 需要有效的 clinical_in_dim（请检查临床列）")
+        # clinical_hidden_dim 优先，否则回退 hidden_dim
+        h = int(cfg.get("clinical_hidden_dim") or cfg.get("hidden_dim") or 256)
+        model = ClinicalOnlyModel(
+            clinical_in_dim, cfg["n_classes"],
+            hidden_dim=h, dropout=cfg["drop_out"],
+        )
+        return model.to(device)
+
+    if cfg["model_type"] in ("mamba_mil", "trans_mil", "s4model") and modality == "pathology":
         model = build_backbone(cfg)
     else:
         backbone = build_backbone(cfg)
-        clinical_in_dim = int(cfg.get("clinical_in_dim", 0) or 0)
-        use_clinical = bool(cfg.get("use_clinical", True)) and clinical_in_dim > 0
+        use_clinical = (modality == "pathomic") and clinical_in_dim > 0
         model = PathomicClassificationModel(
             backbone, cfg["n_classes"], clinical_in_dim,
             fusion_type=cfg.get("fusion_type", "concat"),
@@ -636,15 +729,29 @@ def load_clinical_encoder(path):
         return ClinicalEncoder.from_dict(json.load(f))
 
 
-def build_patient_table(df, label_col="label", feat_path_col=None):
+def build_patient_table(df, label_col="label", feat_path_col=None, require_feats=True):
     """构建患者级表：每个 case 一行，含 y / feat_paths / 临床列。"""
     if label_col not in df.columns:
         raise KeyError(f"CSV 缺少标签列 {label_col}")
-    feat_path_col = resolve_feat_path_col(df, feat_path_col)
 
     df = df.copy()
     df["y"] = df[label_col].map(map_label)
-    df = df.dropna(subset=["case_id", feat_path_col, "y"])
+
+    resolved_feat_col = None
+    if require_feats:
+        resolved_feat_col = resolve_feat_path_col(df, feat_path_col)
+        df = df.dropna(subset=["case_id", resolved_feat_col, "y"])
+    else:
+        # 仅临床模式：特征路径可选
+        if feat_path_col and feat_path_col in df.columns:
+            resolved_feat_col = feat_path_col
+        else:
+            for col in ("slide_feats_path", "slide_feat_path"):
+                if col in df.columns:
+                    resolved_feat_col = col
+                    break
+        df = df.dropna(subset=["case_id", "y"])
+
     clinical_cols = get_clinical_columns(df)
 
     records = []
@@ -652,7 +759,10 @@ def build_patient_table(df, label_col="label", feat_path_col=None):
         labels = g["y"].astype(int).tolist()
         if len(set(labels)) != 1:
             raise ValueError(f"同一 case_id={case_id} 存在不一致 label: {labels}")
-        feat_paths = list(g[feat_path_col].astype(str))
+        if resolved_feat_col is not None:
+            feat_paths = list(g[resolved_feat_col].astype(str))
+        else:
+            feat_paths = []
         rec = {
             "case_id": case_id,
             "y": int(labels[0]),
@@ -662,43 +772,53 @@ def build_patient_table(df, label_col="label", feat_path_col=None):
             rec[col] = g[col].iloc[0]
         records.append(rec)
     pt = pd.DataFrame(records).reset_index(drop=True)
-    return pt, clinical_cols, feat_path_col
+    return pt, clinical_cols, resolved_feat_col
 
 
 class PCRBagDataset(torch.utils.data.Dataset):
     """患者级数据集；每个样本返回 bag 特征 + 临床向量 + 二分类标签。"""
 
-    def __init__(self, pt_df, feat_key, max_slides_train, training, clinical_encoder=None):
+    def __init__(self, pt_df, feat_key, max_slides_train, training,
+                 clinical_encoder=None, clinical_only=False):
         self.pt = pt_df.reset_index(drop=True)
         self.feat_key = feat_key
         self.max_slides_train = max_slides_train
         self.training = training
         self.clinical_encoder = clinical_encoder
+        self.clinical_only = bool(clinical_only)
         if clinical_encoder is not None and clinical_encoder.output_dim > 0:
             self.clinical_matrix = clinical_encoder.transform_df(self.pt)
         else:
             self.clinical_matrix = None
+        if self.clinical_only and self.clinical_matrix is None:
+            raise ValueError("clinical_only 模式需要有效的 clinical_encoder")
 
     def __len__(self):
         return len(self.pt)
 
     def __getitem__(self, idx):
         row = self.pt.iloc[idx]
-        paths = list(row["feat_paths"])
-        if self.training and self.max_slides_train > 0 and len(paths) > self.max_slides_train:
-            paths = random.sample(paths, self.max_slides_train)
-        feats = [load_features(p, self.feat_key) for p in paths]
-        feats = np.concatenate(feats, axis=0)
         if self.clinical_matrix is not None:
             clinical = torch.from_numpy(self.clinical_matrix[idx]).float()
         else:
             clinical = torch.zeros((0,), dtype=torch.float32)
-        return (
-            torch.from_numpy(feats).float(),
-            clinical,
-            int(row["y"]),
-            str(row["case_id"]),
-        )
+
+        if self.clinical_only:
+            # 占位特征，模型不会使用
+            feats = torch.zeros((1, 1), dtype=torch.float32)
+        else:
+            paths = list(row["feat_paths"])
+            if self.training and self.max_slides_train > 0 and len(paths) > self.max_slides_train:
+                paths = random.sample(paths, self.max_slides_train)
+            if not paths:
+                raise ValueError(
+                    f"case_id={row['case_id']} 无 slide 特征路径；"
+                    f"病理/多模态模式需要 slide_feats_path"
+                )
+            arrs = [load_features(p, self.feat_key) for p in paths]
+            feats = torch.from_numpy(np.concatenate(arrs, axis=0)).float()
+
+        return feats, clinical, int(row["y"]), str(row["case_id"])
 
 
 def collate_bag(batch):
@@ -707,8 +827,10 @@ def collate_bag(batch):
 
 
 def make_loader(pt_df, cfg, training, clinical_encoder=None):
+    clinical_only = bool(cfg.get("clinical_only", False)) or cfg.get("modality") == "clinical"
     ds = PCRBagDataset(
-        pt_df, cfg["feat_key"], cfg["max_slides_train"], training, clinical_encoder
+        pt_df, cfg["feat_key"], cfg["max_slides_train"], training,
+        clinical_encoder=clinical_encoder, clinical_only=clinical_only,
     )
     return torch.utils.data.DataLoader(
         ds, batch_size=1, shuffle=training, num_workers=cfg["num_workers"],
@@ -717,11 +839,17 @@ def make_loader(pt_df, cfg, training, clinical_encoder=None):
 
 
 def prepare_clinical_encoder(pt_train, cfg, out_dir=None):
-    if not cfg.get("use_clinical", True):
+    modality = normalize_modality(cfg)
+    if modality == "pathology":
         cfg["clinical_in_dim"] = 0
         return None
     encoder = ClinicalEncoder().fit(pt_train)
     cfg["clinical_in_dim"] = int(encoder.output_dim)
+    if cfg["clinical_in_dim"] <= 0:
+        raise ValueError(
+            f"modality={modality} 需要临床特征，但编码后维度为 0；"
+            f"请检查 CSV 是否包含白名单列 {CLINICAL_WHITELIST}"
+        )
     if out_dir is not None:
         save_clinical_encoder(encoder, os.path.join(out_dir, "clinical_encoder.json"))
     print(f"临床特征维度: {encoder.output_dim}  "
@@ -738,8 +866,11 @@ def prepare_clinical_encoder(pt_train, cfg, out_dir=None):
 
 
 def model_forward(model, feats, clinical, cfg, device):
-    use_clinical = bool(cfg.get("use_clinical", True)) and int(cfg.get("clinical_in_dim", 0) or 0) > 0
-    if use_clinical:
+    modality = normalize_modality(cfg)
+    if modality == "clinical":
+        clinical = clinical.to(device, non_blocking=True)
+        return model(None, clinical)
+    if modality == "pathomic" and int(cfg.get("clinical_in_dim", 0) or 0) > 0:
         clinical = clinical.to(device, non_blocking=True)
         return model(feats, clinical)
     return model(feats, None)
@@ -1109,6 +1240,7 @@ def build_fold_split_record(pt, fold, tr_idx, va_idx, stratify_by):
 
 def save_kfold_splits(log_dir, split_meta, fold_records):
     """将完整 K 折划分写入日志：总表 + 各 fold 子目录。"""
+    os.makedirs(log_dir, exist_ok=True)
     payload = dict(split_meta)
     payload["folds"] = fold_records
     splits_path = os.path.join(log_dir, "kfold_splits.yaml")
@@ -1131,15 +1263,102 @@ def save_kfold_splits(log_dir, split_meta, fold_records):
     return splits_path
 
 
-def train_kfold(pt, cfg, device, log_dir):
-    splits, split_meta = make_kfold_splits(pt, cfg)
-
-    # 先落盘划分结果，再开始训练（便于中断后复现）
-    fold_records = []
-    for fold, (tr_idx, va_idx) in enumerate(splits):
-        fold_records.append(
-            build_fold_split_record(pt, fold, tr_idx, va_idx, split_meta["stratify_by"])
+def resolve_splits_path(splits_path, required=True):
+    """将目录或文件路径解析为 kfold_splits.yaml/.json。"""
+    if splits_path is None or str(splits_path).strip() == "":
+        if required:
+            raise ValueError(
+                "kfold 训练必须提供 --splits_path（预划分结果）。"
+                "请先运行: python make_kfold_splits.py --csv_path ... --out_dir ..."
+            )
+        return None
+    path = os.path.abspath(str(splits_path))
+    if os.path.isdir(path):
+        for name in ("kfold_splits.yaml", "kfold_splits.yml", "kfold_splits.json"):
+            cand = os.path.join(path, name)
+            if os.path.isfile(cand):
+                return cand
+        raise FileNotFoundError(
+            f"目录 {path} 下未找到 kfold_splits.yaml/.json；"
+            f"请先运行 make_kfold_splits.py"
         )
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"划分文件不存在: {path}")
+    return path
+
+
+def load_kfold_splits(splits_path, pt):
+    """
+    从预划分文件加载 K 折索引。
+    返回 (splits, split_meta, fold_records)，splits 为 [(train_idx, val_idx), ...]。
+    """
+    path = resolve_splits_path(splits_path)
+    data = load_config_file(path)
+    if "folds" not in data or not data["folds"]:
+        raise ValueError(f"划分文件缺少 folds: {path}")
+
+    case_to_idx = {str(c): i for i, c in enumerate(pt["case_id"].astype(str).tolist())}
+    all_cases = set(case_to_idx.keys())
+    splits = []
+    fold_records = []
+
+    for rec in data["folds"]:
+        fold = int(rec.get("fold", len(fold_records)))
+        tr_ids = [str(x) for x in rec.get("train_case_ids", [])]
+        va_ids = [str(x) for x in rec.get("val_case_ids", [])]
+        missing = [c for c in tr_ids + va_ids if c not in case_to_idx]
+        if missing:
+            raise KeyError(
+                f"划分 fold={fold} 中有 {len(missing)} 个 case_id 不在当前 CSV："
+                f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
+            )
+        overlap = set(tr_ids) & set(va_ids)
+        if overlap:
+            raise ValueError(f"fold={fold} train/val 存在重叠 case_id: {sorted(overlap)[:5]}")
+
+        tr_idx = np.asarray([case_to_idx[c] for c in tr_ids], dtype=int)
+        va_idx = np.asarray([case_to_idx[c] for c in va_ids], dtype=int)
+        splits.append((tr_idx, va_idx))
+
+        # 用当前患者表重算分布，保证与本次 CSV 一致
+        rebuilt = build_fold_split_record(
+            pt, fold, tr_idx, va_idx, rec.get("stratify_by", data.get("stratify_by"))
+        )
+        fold_records.append(rebuilt)
+
+    covered = set()
+    for tr_idx, va_idx in splits:
+        covered.update(pt.iloc[tr_idx]["case_id"].astype(str).tolist())
+        covered.update(pt.iloc[va_idx]["case_id"].astype(str).tolist())
+    unused = sorted(all_cases - covered)
+    if unused:
+        print(f"警告: 当前 CSV 中有 {len(unused)} 个 case 未出现在划分中（将被忽略）: "
+              f"{unused[:5]}{'...' if len(unused) > 5 else ''}")
+
+    meta = {k: v for k, v in data.items() if k != "folds"}
+    meta["source_splits_path"] = path
+    meta["loaded_from_file"] = True
+    meta["k"] = len(splits)
+    print(f"已从预划分加载 K 折: {path} (k={len(splits)}, "
+          f"stratify_by={meta.get('stratify_by')})")
+    return splits, meta, fold_records
+
+
+def train_kfold(pt, cfg, device, log_dir):
+    """K 折训练：强制从 --splits_path 加载预划分，不再现场划分。"""
+    splits_path = resolve_splits_path(cfg.get("splits_path"), required=True)
+    cfg["splits_path"] = splits_path
+    splits, split_meta, fold_records = load_kfold_splits(splits_path, pt)
+
+    # 与预划分对齐
+    cfg["k"] = int(split_meta.get("k", len(splits)))
+    if split_meta.get("stratify_by"):
+        cfg["stratify_by"] = split_meta["stratify_by"]
+    split_meta["train_seed"] = cfg.get("seed")
+    split_meta["loaded_from_file"] = True
+    split_meta["source_splits_path"] = splits_path
+
+    # 将划分副本写入本次实验日志，保证实验自包含
     save_kfold_splits(log_dir, split_meta, fold_records)
 
     fold_summaries = []
@@ -1178,10 +1397,14 @@ def train_kfold(pt, cfg, device, log_dir):
     summary = {
         "split_mode": "kfold",
         "k": cfg["k"],
-        "stratify_by": split_meta["stratify_by"],
+        "modality": cfg.get("modality"),
+        "clinical_only": bool(cfg.get("clinical_only", False)),
+        "stratify_by": split_meta.get("stratify_by"),
         "stratify_by_requested": split_meta.get("stratify_by_requested"),
         "stratify_fallback": split_meta.get("stratify_fallback", False),
         "splits_file": "kfold_splits.yaml",
+        "source_splits_path": split_meta.get("source_splits_path"),
+        "loaded_from_file": split_meta.get("loaded_from_file", False),
         "folds": fold_summaries,
         "best_epochs": best_epochs,
         "val_auc_per_fold": val_aucs,
@@ -1222,24 +1445,33 @@ def train_all(pt, cfg, device, log_dir):
 
 @torch.no_grad()
 def run_inference(cfg, device, args):
+    modality = normalize_modality(cfg)
     df = read_csv_smart(args.csv_path)
     pt, _, _ = build_patient_table(
         df,
         label_col=cfg.get("label_col", "label"),
         feat_path_col=cfg.get("feat_path_col"),
+        require_feats=(modality != "clinical"),
     )
 
     ckpt_dir = os.path.dirname(os.path.abspath(args.ckpt_path))
     encoder_path = os.path.join(ckpt_dir, "clinical_encoder.json")
     encoder = None
-    if cfg.get("use_clinical", True):
+    if modality in ("pathomic", "clinical"):
         if os.path.isfile(encoder_path):
             encoder = load_clinical_encoder(encoder_path)
             cfg["clinical_in_dim"] = encoder.output_dim
         else:
+            if modality == "clinical":
+                raise FileNotFoundError(
+                    f"clinical_only 推理需要 {encoder_path}"
+                )
             print(f"警告: 未找到 {encoder_path}，将不使用临床特征推理")
+            cfg["modality"] = "pathology"
             cfg["use_clinical"] = False
+            cfg["clinical_only"] = False
             cfg["clinical_in_dim"] = 0
+            modality = "pathology"
 
     model = build_model(cfg, device)
     state = torch.load(args.ckpt_path, map_location=device)
@@ -1249,7 +1481,8 @@ def run_inference(cfg, device, args):
     loader = make_loader(pt, cfg, training=False, clinical_encoder=encoder)
     rows, ys, probs, preds = [], [], [], []
     for feats, clinical, label, cid in loader:
-        feats = feats.to(device)
+        if modality != "clinical":
+            feats = feats.to(device)
         logits = model_forward(model, feats, clinical, cfg, device)
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
@@ -1356,15 +1589,24 @@ def get_args():
 
     # 划分
     p.add_argument("--split_mode", choices=["kfold", "all_train"], default="kfold")
-    p.add_argument("--k", type=int, default=5, help="k 折数量（默认 5）")
+    p.add_argument(
+        "--k", type=int, default=5,
+        help="兼容字段；kfold 时以 --splits_path 文件中的 k 为准",
+    )
     p.add_argument(
         "--stratify_by",
         type=str,
         default="Molecular_label",
         choices=list(STRATIFY_BY_CHOICES),
-        help="K 折分层依据：Molecular_label=按 Molecular 与 label 联合分层（默认）；"
-             "Molecular=仅分子分型；label=仅结局标签；none=不分层随机划分。"
-             "该值会写入 config.yaml / kfold_splits.yaml",
+        help="兼容字段；kfold 时以预划分文件中的 stratify_by 为准。"
+             "实际划分请使用 make_kfold_splits.py --stratify_by",
+    )
+    p.add_argument(
+        "--splits_path",
+        type=str,
+        default=None,
+        help="预划分结果路径（kfold 训练必填）：kfold_splits.yaml/.json 或其父目录。"
+             "须先运行 make_kfold_splits.py 生成",
     )
 
     # 标签 / 特征路径列
@@ -1393,14 +1635,28 @@ def get_args():
     p.add_argument("--feat_key", type=str, default="features",
                    help="h5/dict 中特征键名（默认 features）；.pt 为 tensor 时可忽略")
 
-    # 临床特征中期融合
+    # 模态 / 临床特征
+    p.add_argument(
+        "--modality",
+        type=str,
+        default="pathomic",
+        choices=list(MODALITY_CHOICES),
+        help="输入模态：pathomic=病理+临床融合（默认）；pathology=仅病理；clinical=仅临床",
+    )
+    p.add_argument(
+        "--clinical_only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="仅使用临床信息预测（等价于 --modality clinical）",
+    )
     p.add_argument("--use_clinical", action=argparse.BooleanOptionalAction, default=True,
-                   help="是否使用临床白名单列做中期融合（默认开启；含 Molecular；"
-                        "因子变量 Molecular/T/N/HER2 one-hot，连续变量 Age/ER/PR/Ki67 标准化）")
+                   help="兼容旧开关：--no-use_clinical 等价于 --modality pathology；"
+                        "在 pathomic 下是否融合临床（由 modality 最终决定）")
     p.add_argument("--fusion_type", choices=["concat", "bilinear", "gated"], default="concat",
-                   help="MIL 全局表征与临床嵌入的中期融合方式")
+                   help="MIL 全局表征与临床嵌入的中期融合方式（仅 pathomic）")
     p.add_argument("--clinical_hidden_dim", type=int, default=256,
-                   help="临床 MLP 中间层维度（实际嵌入维 = max(32, hidden_dim//2)）")
+                   help="临床 MLP 隐藏维；clinical_only 时作为分类器宽度，"
+                        "pathomic 时嵌入维 = max(32, hidden_dim//2)")
 
     # MambaMIL 专用
     p.add_argument("--mambamil_layer", type=int, default=2)
@@ -1416,13 +1672,25 @@ def main():
     print("Device:", device)
     cfg = build_config(args)
 
+    # 统一模态（clinical_only / use_clinical 别名）
+    if getattr(args, "clinical_only", False):
+        cfg["clinical_only"] = True
+    if args.config is None and not cfg.get("clinical_only", False):
+        # CLI --no-use_clinical 时，若未显式指定其他 modality，则视为 pathology
+        if cfg.get("use_clinical") is False and cfg.get("modality", "pathomic") == "pathomic":
+            cfg["modality"] = "pathology"
+    modality = normalize_modality(cfg)
+
     if args.mode == "infer":
         assert args.ckpt_path and args.save_infer_dir, "推理需要 --ckpt_path 与 --save_infer_dir"
         assert args.config, "推理需要 --config 指定训练时保存的超参数 yaml/json"
-        if cfg.get("in_dim", -1) is None or cfg.get("in_dim", -1) <= 0:
-            df = read_csv_smart(args.csv_path)
-            feat_col = resolve_feat_path_col(df, cfg.get("feat_path_col"))
-            cfg["in_dim"] = detect_in_dim(df[feat_col].astype(str).tolist(), cfg["feat_key"])
+        if modality != "clinical":
+            if cfg.get("in_dim", -1) is None or cfg.get("in_dim", -1) <= 0:
+                df = read_csv_smart(args.csv_path)
+                feat_col = resolve_feat_path_col(df, cfg.get("feat_path_col"))
+                cfg["in_dim"] = detect_in_dim(df[feat_col].astype(str).tolist(), cfg["feat_key"])
+        else:
+            cfg["in_dim"] = 0
         set_seed(cfg["seed"])
         run_inference(cfg, device, args)
         return
@@ -1431,20 +1699,32 @@ def main():
     set_seed(cfg["seed"])
     df = read_csv_smart(args.csv_path)
     pt, clinical_cols, feat_col = build_patient_table(
-        df, label_col=cfg.get("label_col", "label"), feat_path_col=cfg.get("feat_path_col")
+        df,
+        label_col=cfg.get("label_col", "label"),
+        feat_path_col=cfg.get("feat_path_col"),
+        require_feats=(modality != "clinical"),
     )
     cfg["feat_path_col"] = feat_col
     cfg["n_classes"] = 2
-    cfg["stratify_by"] = normalize_stratify_by(cfg.get("stratify_by", "Molecular_label"))
-    if cfg["in_dim"] is None or cfg["in_dim"] <= 0:
+
+    if cfg["split_mode"] == "kfold":
+        cfg["splits_path"] = resolve_splits_path(cfg.get("splits_path"), required=True)
+    else:
+        cfg["splits_path"] = resolve_splits_path(cfg.get("splits_path"), required=False)
+
+    if modality == "clinical":
+        cfg["in_dim"] = 0
+    elif cfg["in_dim"] is None or cfg["in_dim"] <= 0:
         all_paths = [p for ps in pt["feat_paths"] for p in ps]
         cfg["in_dim"] = detect_in_dim(all_paths, cfg["feat_key"])
+
     print(
         f"患者数: {len(pt)}, pCR(1)={int((pt['y'] == 1).sum())}, "
         f"N-pCR(0)={int((pt['y'] == 0).sum())}, "
-        f"特征维度: {cfg['in_dim']}, n_classes: {cfg['n_classes']}, "
+        f"modality={modality}, in_dim={cfg['in_dim']}, n_classes={cfg['n_classes']}, "
         f"临床列: {clinical_cols}, fusion: {cfg.get('fusion_type', 'concat')}, "
-        f"stratify_by: {cfg.get('stratify_by')}"
+        f"split_mode: {cfg.get('split_mode')}, "
+        f"splits_path: {cfg.get('splits_path')}"
     )
 
     log_dir = os.path.join(args.log_root, args.exp_name)
