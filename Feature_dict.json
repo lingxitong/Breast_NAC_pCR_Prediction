@@ -1,0 +1,14 @@
+{
+    "case_id": "患者ID",
+    "slide_id": "切片ID",
+    "slide_feats_path": "切片特征文件路径（.pt 或 .h5）",
+    "label": "病理完全缓解标签：N-pCR→0，pCR→1",
+    "Molecular": "分子分型：HR+HER2- / HR+HER2+ / TNBC / HER2",
+    "T": "临床T分期（因子变量）",
+    "N": "临床N分期（因子变量）",
+    "Age": "年龄（连续变量）",
+    "ER": "ER（连续变量，%或评分）",
+    "PR": "PR（连续变量，%或评分）",
+    "HER2": "HER2 IHC评分（因子变量，如0/1/2/3；与Molecular取值HER2含义不同）",
+    "Ki67": "Ki67（连续变量，%）"
+}

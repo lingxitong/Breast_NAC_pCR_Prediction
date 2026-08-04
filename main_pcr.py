@@ -12,7 +12,7 @@ main_pcr.py
   * 一个患者(case)可能有多张 slide，训练时拼接成一个 bag；若 slide 数 > max_slides
     则随机选取 max_slides 张拼接；推理时拼接全部 slide。
 
-输入 CSV 格式见 Example_Dataset_Csv.csv / 根目录 example_dataset.csv，关键列：
+输入 CSV 格式见项目根目录 example_dataset.csv，关键列：
   case_id, slide_id, slide_feats_path, label,
   Molecular, T, N, Age, ER, PR, HER2, Ki67
 其中 label 可为字符串 N-pCR/pCR，或已映射的 0/1。
@@ -24,19 +24,19 @@ Molecular 取值（四种）：HR+HER2- / HR+HER2+ / TNBC / HER2。
 
 支持三种运行模式（--mode）:
   train  : 训练。--split_mode 控制 kfold（默认）或 all_train。
-  infer  : 推理。给定超参 json + 权重 + csv，输出指标和每个患者的预测概率。
+  infer  : 推理。给定超参 yaml/json + 权重 + csv，输出指标和每个患者的预测概率。
 
 K 折划分：由 --stratify_by 指定分层依据（默认 Molecular_label，即
   label 与 Molecular 联合分层）；划分结果写入日志
   （kfold_splits.yaml 与各 fold_*/split.yaml）。
 超参数：训练时以 config.yaml 写入日志目录；推理 --config 支持 yaml/json。
 
-示例：
+示例（在项目根目录执行）：
   python main_pcr.py --mode train --split_mode kfold \\
-      --csv_path Example_Dataset_Csv.csv --log_root ./logs --exp_name pcr_kfold
+      --csv_path example_dataset.csv --log_root ./logs --exp_name pcr_kfold
 
   python main_pcr.py --mode train --split_mode all_train \\
-      --csv_path Example_Dataset_Csv.csv --log_root ./logs --exp_name pcr_all
+      --csv_path example_dataset.csv --log_root ./logs --exp_name pcr_all
 
   python main_pcr.py --mode infer --config ./logs/pcr_kfold/config.yaml \\
       --ckpt_path ./logs/pcr_kfold/fold_0/checkpoint_best.pt \\
@@ -397,7 +397,8 @@ def _build_repo_model(cfg):
     """从 MambaMIL 仓库动态构建模型（仅 path-only，无临床融合）。"""
     import sys
 
-    repo_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "MambaMIL")
+    # 可选依赖：与本脚本同级的 MambaMIL 目录
+    repo_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MambaMIL")
     repo_root = os.path.abspath(repo_root)
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
@@ -1343,7 +1344,7 @@ def get_args():
     p.add_argument("--mode", choices=["train", "infer"], default="train")
 
     # 数据 / 路径
-    p.add_argument("--csv_path", type=str, required=True, help="输入 CSV（见 Example_Dataset_Csv.csv）")
+    p.add_argument("--csv_path", type=str, required=True, help="输入 CSV（见 example_dataset.csv）")
     p.add_argument("--log_root", type=str, default="./logs", help="日志根目录（train）")
     p.add_argument("--exp_name", type=str, default="exp", help="实验名（train）")
     p.add_argument("--config", type=str, default=None,
