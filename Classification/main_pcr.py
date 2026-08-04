@@ -13,14 +13,23 @@ main_pcr.py
     则随机选取 max_slides 张拼接；推理时拼接全部 slide。
 
 输入 CSV 格式见 Example_Dataset_Csv.csv / 根目录 example_dataset.csv，关键列：
-  case_id, slide_id, slide_feats_path, label, T, N, Age, ER, PR, HER2, Ki67
+  case_id, slide_id, slide_feats_path, label,
+  Molecular, T, N, Age, ER, PR, HER2, Ki67
 其中 label 可为字符串 N-pCR/pCR，或已映射的 0/1。
 slide_feats_path 指向每张 slide 的特征文件（.pt 或 .h5）。
-临床融合默认仅使用白名单列：T, N, Age, ER, PR, HER2, Ki67（不含 Molecular）。
+临床融合白名单列：
+  因子变量（one-hot）：Molecular, T, N, HER2
+  连续变量（标准化）：Age, ER, PR, Ki67
+Molecular 取值（四种）：HR+HER2- / HR+HER2+ / TNBC / HER2。
 
 支持三种运行模式（--mode）:
   train  : 训练。--split_mode 控制 kfold（默认）或 all_train。
   infer  : 推理。给定超参 json + 权重 + csv，输出指标和每个患者的预测概率。
+
+K 折划分：由 --stratify_by 指定分层依据（默认 Molecular_label，即
+  label 与 Molecular 联合分层）；划分结果写入日志
+  （kfold_splits.yaml 与各 fold_*/split.yaml）。
+超参数：训练时以 config.yaml 写入日志目录；推理 --config 支持 yaml/json。
 
 示例：
   python main_pcr.py --mode train --split_mode kfold \\
@@ -29,7 +38,7 @@ slide_feats_path 指向每张 slide 的特征文件（.pt 或 .h5）。
   python main_pcr.py --mode train --split_mode all_train \\
       --csv_path Example_Dataset_Csv.csv --log_root ./logs --exp_name pcr_all
 
-  python main_pcr.py --mode infer --config ./logs/pcr_kfold/config.json \\
+  python main_pcr.py --mode infer --config ./logs/pcr_kfold/config.yaml \\
       --ckpt_path ./logs/pcr_kfold/fold_0/checkpoint_best.pt \\
       --csv_path test.csv --save_infer_dir ./infer_pcr
 """
@@ -46,6 +55,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -59,11 +69,70 @@ try:
 except ImportError:  # pragma: no cover
     h5py = None
 
+
+# ----------------------------------------------------------------------------
+# YAML / JSON 配置 IO
+# ----------------------------------------------------------------------------
+def _to_builtin(obj):
+    """将 numpy / pandas 标量转为可 YAML/JSON 序列化的 Python 内置类型。"""
+    if isinstance(obj, dict):
+        return {str(k): _to_builtin(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_builtin(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_to_builtin(v) for v in obj.tolist()]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        val = float(obj)
+        return None if np.isnan(val) else val
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, float) and np.isnan(obj):
+        return None
+    return obj
+
+
+def save_yaml(obj, path):
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            _to_builtin(obj), f,
+            allow_unicode=True, sort_keys=False, default_flow_style=False,
+        )
+
+
+def load_yaml(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def load_config_file(path):
+    """加载超参数配置，支持 .yaml/.yml/.json。"""
+    path = str(path)
+    lower = path.lower()
+    if lower.endswith((".yaml", ".yml")):
+        data = load_yaml(path)
+    elif lower.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        # 扩展名不明时优先按 YAML，失败再尝试 JSON
+        try:
+            data = load_yaml(path)
+        except Exception:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"配置文件顶层应为 mapping/dict: {path}")
+    return data
+
 # ----------------------------------------------------------------------------
 # 超参数 / 列约定
 # ----------------------------------------------------------------------------
 HPARAM_KEYS = [
-    "k", "split_mode", "n_classes", "max_epochs", "lr", "reg",
+    "k", "split_mode", "stratify_by", "n_classes", "max_epochs", "lr", "reg",
     "drop_out", "gc", "seed", "opt", "model_type", "in_dim",
     "hidden_dim", "max_slides_train", "feat_key", "num_workers",
     "mambamil_layer", "mambamil_rate", "mambamil_type",
@@ -71,17 +140,31 @@ HPARAM_KEYS = [
     "label_col", "feat_path_col",
 ]
 
+# K 折分层依据（写入 config.yaml / kfold_splits.yaml 的 stratify_by）
+STRATIFY_BY_CHOICES = ("Molecular_label", "Molecular", "label", "none")
+
 # 标识 / 路径 / 标签列（禁止作为临床特征）
 META_COLS = {
     "case_id", "slide_id",
     "slide_feats_path", "slide_feat_path",
     "label", "y", "feat_paths",
 }
-# 明确排除分子分型
-EXCLUDED_CLINICAL = {"Molecular", "Molecular_subtype", "molecular", "molecular_subtype"}
+# 不再排除分子分型；保留空集以兼容旧逻辑
+EXCLUDED_CLINICAL = set()
+# 因子变量：one-hot 编码（Molecular / T / N / HER2）
+CATEGORICAL_COLS = ["Molecular", "T", "N", "HER2"]
+# 连续变量：z-score 标准化（Age / ER / PR / Ki67）
+NUMERIC_COLS = ["Age", "ER", "PR", "Ki67"]
 # 临床白名单：仅这些列参与融合（若 CSV 中存在）
-CLINICAL_WHITELIST = ["T", "N", "Age", "ER", "PR", "HER2", "Ki67"]
-KNOWN_CATEGORICAL = set()
+CLINICAL_WHITELIST = CATEGORICAL_COLS + NUMERIC_COLS
+KNOWN_CATEGORICAL = set(CATEGORICAL_COLS)
+KNOWN_NUMERIC = set(NUMERIC_COLS)
+# 预定义类别（训练时与数据中出现的取值取并集，保证折间维度稳定）
+# 分子分型预置四类（即使某折未出现也保留 one-hot 维度）
+MOLECULAR_CATEGORIES = ["HR+HER2-", "HR+HER2+", "TNBC", "HER2"]
+KNOWN_CATEGORIES = {
+    "Molecular": list(MOLECULAR_CATEGORIES),
+}
 
 LABEL_MAP = {
     "n-pcr": 0, "n_pcr": 0, "npcr": 0, "0": 0, 0: 0,
@@ -122,7 +205,7 @@ def resolve_feat_path_col(df, preferred=None):
 
 
 def get_clinical_columns(df):
-    """仅返回白名单中且实际存在的临床列，并排除 Molecular。"""
+    """仅返回白名单中且实际存在的临床列（因子 + 连续）。"""
     cols = []
     for c in CLINICAL_WHITELIST:
         if c in df.columns and c not in EXCLUDED_CLINICAL and c not in META_COLS:
@@ -409,7 +492,13 @@ def detect_in_dim(feat_paths, feat_key):
 
 
 class ClinicalEncoder:
-    """将 CSV 临床列编码为固定长度 float 向量（数值标准化 + 类别 one-hot）。"""
+    """
+    将 CSV 临床列编码为固定长度 float 向量：
+      * 连续变量（Age/ER/PR/Ki67）：缺失填均值后做 z-score 标准化
+      * 因子变量（Molecular/T/N/HER2）：按训练期类别表做 one-hot
+    列类型由 KNOWN_NUMERIC / KNOWN_CATEGORICAL 显式指定，
+    避免 T/N/HER2 因数值型 dtype 被误当作连续变量。
+    """
 
     def __init__(self):
         self.numeric_cols = []
@@ -421,15 +510,39 @@ class ClinicalEncoder:
         self.fitted = False
 
     def _detect_columns(self, df, clinical_cols):
+        """按白名单显式区分因子变量与连续变量。"""
         numeric_cols, categorical_cols = [], []
         for col in clinical_cols:
             series = df[col]
-            if col in KNOWN_CATEGORICAL or series.dtype == object:
+            if col in KNOWN_CATEGORICAL:
                 categorical_cols.append(col)
-                continue
-            numeric_cols.append(col)
-        self.numeric_cols = numeric_cols
-        self.categorical_cols = categorical_cols
+            elif col in KNOWN_NUMERIC:
+                numeric_cols.append(col)
+            elif series.dtype == object or str(series.dtype) == "category":
+                categorical_cols.append(col)
+            else:
+                # 未声明类型时回退为连续变量
+                numeric_cols.append(col)
+        # 保持白名单顺序，便于复现与排查
+        order = {c: i for i, c in enumerate(CLINICAL_WHITELIST)}
+        self.numeric_cols = sorted(numeric_cols, key=lambda c: order.get(c, 999))
+        self.categorical_cols = sorted(categorical_cols, key=lambda c: order.get(c, 999))
+
+    @staticmethod
+    def _normalize_cat_value(raw):
+        if pd.isna(raw):
+            return "missing"
+        # 数值型因子（如 T/N/HER2）统一为去尾零的字符串，避免 "1.0" vs "1"
+        if isinstance(raw, (int, np.integer)):
+            return str(int(raw))
+        if isinstance(raw, (float, np.floating)):
+            if np.isnan(raw):
+                return "missing"
+            if float(raw).is_integer():
+                return str(int(raw))
+            return str(raw)
+        s = str(raw).strip()
+        return s if s else "missing"
 
     def fit(self, df):
         clinical_cols = get_clinical_columns(df)
@@ -450,10 +563,16 @@ class ClinicalEncoder:
             self.numeric_mean[col] = mean
             self.numeric_std[col] = std
         for col in self.categorical_cols:
-            cats = df[col].fillna("missing").astype(str).unique().tolist()
-            cats = sorted(set(cats))
-            if "missing" not in cats:
-                cats.append("missing")
+            seen = {
+                self._normalize_cat_value(v)
+                for v in df[col].tolist()
+            }
+            preset = {
+                self._normalize_cat_value(v)
+                for v in KNOWN_CATEGORIES.get(col, [])
+            }
+            cats = sorted((seen | preset) - {"missing"})
+            cats.append("missing")
             self.cat_categories[col] = cats
         self.output_dim = len(self.numeric_cols) + sum(
             len(self.cat_categories[c]) for c in self.categorical_cols
@@ -465,15 +584,17 @@ class ClinicalEncoder:
         if not self.fitted or self.output_dim == 0:
             return np.zeros((0,), dtype=np.float32)
         feats = []
+        # 连续变量在前，因子 one-hot 在后（与 fit 时 output_dim 计算一致）
         for col in self.numeric_cols:
             val = pd.to_numeric(row.get(col, np.nan), errors="coerce")
             val = float(val) if pd.notna(val) else self.numeric_mean[col]
             val = (val - self.numeric_mean[col]) / self.numeric_std[col]
             feats.append(val)
         for col in self.categorical_cols:
-            raw = row.get(col, "missing")
-            val = "missing" if pd.isna(raw) else str(raw)
+            val = self._normalize_cat_value(row.get(col, "missing"))
             cats = self.cat_categories[col]
+            if val not in cats:
+                val = "missing"
             onehot = [1.0 if val == c else 0.0 for c in cats]
             feats.extend(onehot)
         return np.asarray(feats, dtype=np.float32)
@@ -603,13 +724,15 @@ def prepare_clinical_encoder(pt_train, cfg, out_dir=None):
     if out_dir is not None:
         save_clinical_encoder(encoder, os.path.join(out_dir, "clinical_encoder.json"))
     print(f"临床特征维度: {encoder.output_dim}  "
-          f"(数值列 {len(encoder.numeric_cols)}, 类别列 {len(encoder.categorical_cols)})")
+          f"(连续变量 {len(encoder.numeric_cols)}, 因子变量 {len(encoder.categorical_cols)})")
     if encoder.numeric_cols:
-        print(f"  数值列: {encoder.numeric_cols}")
+        print(f"  连续变量(标准化): {encoder.numeric_cols}")
     if encoder.categorical_cols:
-        print(f"  类别列: {encoder.categorical_cols}")
+        print(f"  因子变量(one-hot): {encoder.categorical_cols}")
+        for col in encoder.categorical_cols:
+            print(f"    {col}: {encoder.cat_categories.get(col, [])}")
     print(f"  白名单: {CLINICAL_WHITELIST}")
-    print(f"  已排除: {sorted(META_COLS | EXCLUDED_CLINICAL)}")
+    print(f"  元信息/禁止列: {sorted(META_COLS | EXCLUDED_CLINICAL)}")
     return encoder
 
 
@@ -770,16 +893,253 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
     }
 
 
-def train_kfold(pt, cfg, device, log_dir):
-    y = pt["y"].values
+def _molecular_series(pt):
+    """返回患者级 Molecular 字符串序列；缺失记为 missing。"""
+    if "Molecular" not in pt.columns:
+        return None
+    return pt["Molecular"].fillna("missing").astype(str).str.strip().replace("", "missing")
+
+
+def _value_counts_dict(series):
+    if series is None:
+        return {}
+    return {str(k): int(v) for k, v in series.value_counts().sort_index().items()}
+
+
+def normalize_stratify_by(value):
+    """规范化 stratify_by 超参取值。"""
+    if value is None:
+        return "Molecular_label"
+    key = str(value).strip()
+    aliases = {
+        "molecular_label": "Molecular_label",
+        "molecular+label": "Molecular_label",
+        "label+molecular": "Molecular_label",
+        "label_molecular": "Molecular_label",
+        "mol_label": "Molecular_label",
+        "joint": "Molecular_label",
+        "molecular": "Molecular",
+        "mol": "Molecular",
+        "y": "label",
+        "random": "none",
+        "kfold_random": "none",
+        "nonstratified": "none",
+    }
+    key_norm = aliases.get(key.lower(), key)
+    if key_norm not in STRATIFY_BY_CHOICES:
+        raise ValueError(
+            f"未知 stratify_by={value!r}，可选: {list(STRATIFY_BY_CHOICES)}"
+        )
+    return key_norm
+
+
+def build_kfold_stratify_labels(pt, stratify_by="Molecular_label"):
+    """
+    按超参 stratify_by 构造分层标签。
+    返回 (stratify_array_or_None, requested_strategy)。
+    stratify_array 为 None 表示不分层（普通 KFold）。
+    """
+    strategy = normalize_stratify_by(stratify_by)
+    y = pt["y"].astype(int)
+    mol = _molecular_series(pt)
+
+    if strategy == "none":
+        print("K 折不分层（stratify_by=none），使用普通随机 KFold")
+        return None, strategy
+
+    if strategy == "label":
+        print(f"K 折按 label 分层，分布: {_value_counts_dict(y.astype(str))}")
+        return y.values, strategy
+
+    if strategy == "Molecular":
+        if mol is None:
+            raise ValueError("stratify_by=Molecular 但患者表缺少 Molecular 列")
+        print(f"K 折按 Molecular 分层，分布: {_value_counts_dict(mol)}")
+        return mol.values, strategy
+
+    # Molecular_label：label 与 Molecular 联合分层
+    if mol is None:
+        raise ValueError("stratify_by=Molecular_label 但患者表缺少 Molecular 列")
+    joint = mol.astype(str) + "|y" + y.astype(str)
+    print(
+        f"K 折按 Molecular+label 联合分层，联合分布: {_value_counts_dict(joint)}"
+    )
+    return joint.values, strategy
+
+
+def make_kfold_splits(pt, cfg):
+    """
+    生成 K 折索引。
+    分层依据由 cfg['stratify_by'] 控制：
+      Molecular_label / Molecular / label / none
+    若请求的分层因样本量不足失败，则按
+      Molecular_label -> Molecular -> label -> none
+    依次回退，并在 meta 中记录 requested / actual。
+    返回 (splits, split_meta)。
+    """
+    n_splits = int(cfg["k"])
+    seed = int(cfg["seed"])
     case_ids = pt["case_id"].values
-    try:
-        splitter = StratifiedKFold(n_splits=cfg["k"], shuffle=True, random_state=cfg["seed"])
-        splits = list(splitter.split(case_ids, y))
-    except ValueError:
-        print("警告: 分层划分失败，回退到普通 KFold")
-        splitter = KFold(n_splits=cfg["k"], shuffle=True, random_state=cfg["seed"])
-        splits = list(splitter.split(case_ids))
+    requested = normalize_stratify_by(cfg.get("stratify_by", "Molecular_label"))
+    cfg["stratify_by"] = requested  # 规范化后写回，确保 config.yaml 一致
+
+    def _try_stratified(labels, name):
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        splits = list(splitter.split(case_ids, labels))
+        return splits, name
+
+    def _random_split():
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        return list(splitter.split(case_ids)), "none"
+
+    # 回退链：从请求策略开始，去掉已更“强”的前置项
+    fallback_order = ["Molecular_label", "Molecular", "label", "none"]
+    start = fallback_order.index(requested)
+    chain = fallback_order[start:]
+
+    splits, actual = None, None
+    errors = []
+    for cand in chain:
+        try:
+            if cand == "none":
+                splits, actual = _random_split()
+            else:
+                labels, name = build_kfold_stratify_labels(pt, cand)
+                splits, actual = _try_stratified(labels, name)
+            if cand != requested:
+                print(f"警告: stratify_by={requested} 不可用，已回退为 {actual}")
+            break
+        except ValueError as e:
+            errors.append(f"{cand}: {e}")
+            print(f"警告: 按 {cand} 划分失败（{e}）")
+            continue
+
+    if splits is None:
+        raise RuntimeError(
+            "无法完成 K 折划分，尝试记录: " + " | ".join(errors)
+        )
+
+    mol = _molecular_series(pt)
+    joint = None
+    if mol is not None:
+        joint = mol.astype(str) + "|y" + pt["y"].astype(int).astype(str)
+
+    meta = {
+        "split_mode": "kfold",
+        "k": n_splits,
+        "seed": seed,
+        "stratify_by": actual,                 # 实际使用的划分依据
+        "stratify_by_requested": requested,    # 超参请求的划分依据
+        "stratify_fallback": actual != requested,
+        "n_cases": int(len(pt)),
+        "overall_molecular": _value_counts_dict(mol),
+        "overall_label": {
+            "N-pCR(0)": int((pt["y"] == 0).sum()),
+            "pCR(1)": int((pt["y"] == 1).sum()),
+        },
+        "overall_molecular_label": _value_counts_dict(joint),
+    }
+    print(
+        f"K 折划分策略: stratify_by={actual}"
+        f"{'' if actual == requested else f' (requested={requested})'}, "
+        f"k={n_splits}, seed={seed}"
+    )
+    return splits, meta
+
+
+def build_fold_split_record(pt, fold, tr_idx, va_idx, stratify_by):
+    """构造单折划分记录（含 case_id / Molecular / label 分布）。"""
+    pt_tr = pt.iloc[tr_idx]
+    pt_va = pt.iloc[va_idx]
+    mol_all = _molecular_series(pt)
+    mol_tr = mol_all.iloc[tr_idx] if mol_all is not None else None
+    mol_va = mol_all.iloc[va_idx] if mol_all is not None else None
+
+    train_cases = []
+    for i in tr_idx:
+        row = pt.iloc[int(i)]
+        train_cases.append({
+            "case_id": str(row["case_id"]),
+            "label": int(row["y"]),
+            "Molecular": (
+                str(mol_all.iloc[int(i)]) if mol_all is not None else None
+            ),
+        })
+    val_cases = []
+    for i in va_idx:
+        row = pt.iloc[int(i)]
+        val_cases.append({
+            "case_id": str(row["case_id"]),
+            "label": int(row["y"]),
+            "Molecular": (
+                str(mol_all.iloc[int(i)]) if mol_all is not None else None
+            ),
+        })
+
+    return {
+        "fold": int(fold),
+        "stratify_by": stratify_by,
+        "n_train": int(len(tr_idx)),
+        "n_val": int(len(va_idx)),
+        "train_case_ids": [c["case_id"] for c in train_cases],
+        "val_case_ids": [c["case_id"] for c in val_cases],
+        "train_cases": train_cases,
+        "val_cases": val_cases,
+        "train_molecular": _value_counts_dict(mol_tr),
+        "val_molecular": _value_counts_dict(mol_va),
+        "train_label": {
+            "N-pCR(0)": int((pt_tr["y"] == 0).sum()),
+            "pCR(1)": int((pt_tr["y"] == 1).sum()),
+        },
+        "val_label": {
+            "N-pCR(0)": int((pt_va["y"] == 0).sum()),
+            "pCR(1)": int((pt_va["y"] == 1).sum()),
+        },
+        "train_molecular_label": _value_counts_dict(
+            (mol_tr.astype(str) + "|y" + pt_tr["y"].astype(int).astype(str))
+            if mol_tr is not None else None
+        ),
+        "val_molecular_label": _value_counts_dict(
+            (mol_va.astype(str) + "|y" + pt_va["y"].astype(int).astype(str))
+            if mol_va is not None else None
+        ),
+    }
+
+
+def save_kfold_splits(log_dir, split_meta, fold_records):
+    """将完整 K 折划分写入日志：总表 + 各 fold 子目录。"""
+    payload = dict(split_meta)
+    payload["folds"] = fold_records
+    splits_path = os.path.join(log_dir, "kfold_splits.yaml")
+    save_yaml(payload, splits_path)
+    # 同步一份 json，便于程序读取
+    with open(os.path.join(log_dir, "kfold_splits.json"), "w", encoding="utf-8") as f:
+        json.dump(_to_builtin(payload), f, ensure_ascii=False, indent=2)
+
+    for rec in fold_records:
+        fold_dir = os.path.join(log_dir, f"fold_{rec['fold']}")
+        os.makedirs(fold_dir, exist_ok=True)
+        save_yaml(rec, os.path.join(fold_dir, "split.yaml"))
+        # 便于快速查看的 case_id 列表
+        with open(os.path.join(fold_dir, "train_case_ids.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(rec["train_case_ids"]) + ("\n" if rec["train_case_ids"] else ""))
+        with open(os.path.join(fold_dir, "val_case_ids.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(rec["val_case_ids"]) + ("\n" if rec["val_case_ids"] else ""))
+
+    print(f"K 折划分已保存: {splits_path}")
+    return splits_path
+
+
+def train_kfold(pt, cfg, device, log_dir):
+    splits, split_meta = make_kfold_splits(pt, cfg)
+
+    # 先落盘划分结果，再开始训练（便于中断后复现）
+    fold_records = []
+    for fold, (tr_idx, va_idx) in enumerate(splits):
+        fold_records.append(
+            build_fold_split_record(pt, fold, tr_idx, va_idx, split_meta["stratify_by"])
+        )
+    save_kfold_splits(log_dir, split_meta, fold_records)
 
     fold_summaries = []
     best_epochs = []
@@ -787,6 +1147,14 @@ def train_kfold(pt, cfg, device, log_dir):
 
     for fold, (tr_idx, va_idx) in enumerate(splits):
         print(f"\n========== Fold {fold} / {cfg['k']} ==========")
+        print(
+            f"  train Molecular: {fold_records[fold]['train_molecular']}, "
+            f"val Molecular: {fold_records[fold]['val_molecular']}"
+        )
+        print(
+            f"  train Molecular|label: {fold_records[fold]['train_molecular_label']}, "
+            f"val Molecular|label: {fold_records[fold]['val_molecular_label']}"
+        )
         pt_tr = pt.iloc[tr_idx].reset_index(drop=True)
         pt_va = pt.iloc[va_idx].reset_index(drop=True)
         fold_dir = os.path.join(log_dir, f"fold_{fold}")
@@ -801,12 +1169,18 @@ def train_kfold(pt, cfg, device, log_dir):
             "n_val": int(len(pt_va)),
             "n_train_pos": int((pt_tr["y"] == 1).sum()),
             "n_val_pos": int((pt_va["y"] == 1).sum()),
+            "train_molecular": fold_records[fold]["train_molecular"],
+            "val_molecular": fold_records[fold]["val_molecular"],
         })
 
     valid = [v for v in val_aucs if v is not None and v == v]
     summary = {
         "split_mode": "kfold",
         "k": cfg["k"],
+        "stratify_by": split_meta["stratify_by"],
+        "stratify_by_requested": split_meta.get("stratify_by_requested"),
+        "stratify_fallback": split_meta.get("stratify_fallback", False),
+        "splits_file": "kfold_splits.yaml",
         "folds": fold_summaries,
         "best_epochs": best_epochs,
         "val_auc_per_fold": val_aucs,
@@ -814,9 +1188,11 @@ def train_kfold(pt, cfg, device, log_dir):
         "std_val_auc": float(np.std(valid)) if valid else None,
         "label_map": {"N-pCR": 0, "pCR": 1},
     }
+    save_yaml(summary, os.path.join(log_dir, "kfold_summary.yaml"))
     with open(os.path.join(log_dir, "kfold_summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+        json.dump(_to_builtin(summary), f, ensure_ascii=False, indent=2)
     print("\n===== K-fold 完成 =====")
+    print(f"stratify_by: {split_meta['stratify_by']}")
     print(f"best_epochs: {best_epochs}")
     print(f"mean_val_auc: {summary['mean_val_auc']}")
     return summary
@@ -835,8 +1211,9 @@ def train_all(pt, cfg, device, log_dir):
         "ckpt_best_loss": os.path.join(log_dir, "checkpoint_best_loss.pt"),
         "label_map": {"N-pCR": 0, "pCR": 1},
     }
+    save_yaml(summary, os.path.join(log_dir, "all_train_summary.yaml"))
     with open(os.path.join(log_dir, "all_train_summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+        json.dump(_to_builtin(summary), f, ensure_ascii=False, indent=2)
     print("\n===== All-train 完成 =====")
     print(f"最低 train loss epoch: {res['best_epoch']}, loss={res['best_loss']:.4f}")
     return summary
@@ -935,12 +1312,11 @@ def read_csv_smart(path):
 
 
 def build_config(args):
-    """组装超参数配置：CLI 默认 -> 若指定 --config 则用 json 覆盖 HPARAM_KEYS。"""
+    """组装超参数配置：CLI 默认 -> 若指定 --config 则用 yaml/json 覆盖 HPARAM_KEYS。"""
     cfg = {k: getattr(args, k) for k in HPARAM_KEYS if hasattr(args, k)}
     cfg["n_classes"] = 2
     if args.config and os.path.isfile(args.config):
-        with open(args.config, "r", encoding="utf-8") as f:
-            override = json.load(f)
+        override = load_config_file(args.config)
         for k, v in override.items():
             if k in HPARAM_KEYS:
                 cfg[k] = v
@@ -948,6 +1324,18 @@ def build_config(args):
               f"{[k for k in override if k in HPARAM_KEYS]}")
     cfg["n_classes"] = 2
     return cfg
+
+
+def save_run_config(cfg, log_dir):
+    """将超参数以 YAML 写入日志（主格式）；额外保留 json 便于兼容。"""
+    os.makedirs(log_dir, exist_ok=True)
+    yaml_path = os.path.join(log_dir, "config.yaml")
+    json_path = os.path.join(log_dir, "config.json")
+    save_yaml(cfg, yaml_path)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(_to_builtin(cfg), f, ensure_ascii=False, indent=2)
+    print(f"超参数已保存到 {yaml_path}（并同步 {json_path}）")
+    return yaml_path
 
 
 def get_args():
@@ -958,7 +1346,8 @@ def get_args():
     p.add_argument("--csv_path", type=str, required=True, help="输入 CSV（见 Example_Dataset_Csv.csv）")
     p.add_argument("--log_root", type=str, default="./logs", help="日志根目录（train）")
     p.add_argument("--exp_name", type=str, default="exp", help="实验名（train）")
-    p.add_argument("--config", type=str, default=None, help="超参数 json：覆盖默认/提供推理所需模型超参")
+    p.add_argument("--config", type=str, default=None,
+                   help="超参数配置文件（yaml/yml/json）：覆盖默认或提供推理所需模型超参")
 
     # 推理
     p.add_argument("--ckpt_path", type=str, default=None, help="权重路径（infer）")
@@ -967,6 +1356,15 @@ def get_args():
     # 划分
     p.add_argument("--split_mode", choices=["kfold", "all_train"], default="kfold")
     p.add_argument("--k", type=int, default=5, help="k 折数量（默认 5）")
+    p.add_argument(
+        "--stratify_by",
+        type=str,
+        default="Molecular_label",
+        choices=list(STRATIFY_BY_CHOICES),
+        help="K 折分层依据：Molecular_label=按 Molecular 与 label 联合分层（默认）；"
+             "Molecular=仅分子分型；label=仅结局标签；none=不分层随机划分。"
+             "该值会写入 config.yaml / kfold_splits.yaml",
+    )
 
     # 标签 / 特征路径列
     p.add_argument("--label_col", type=str, default="label", help="标签列名（N-pCR/pCR 或 0/1）")
@@ -996,7 +1394,8 @@ def get_args():
 
     # 临床特征中期融合
     p.add_argument("--use_clinical", action=argparse.BooleanOptionalAction, default=True,
-                   help="是否使用临床白名单列做中期融合（默认开启；不含 Molecular）")
+                   help="是否使用临床白名单列做中期融合（默认开启；含 Molecular；"
+                        "因子变量 Molecular/T/N/HER2 one-hot，连续变量 Age/ER/PR/Ki67 标准化）")
     p.add_argument("--fusion_type", choices=["concat", "bilinear", "gated"], default="concat",
                    help="MIL 全局表征与临床嵌入的中期融合方式")
     p.add_argument("--clinical_hidden_dim", type=int, default=256,
@@ -1018,7 +1417,7 @@ def main():
 
     if args.mode == "infer":
         assert args.ckpt_path and args.save_infer_dir, "推理需要 --ckpt_path 与 --save_infer_dir"
-        assert args.config, "推理需要 --config 指定训练时保存的超参数 json"
+        assert args.config, "推理需要 --config 指定训练时保存的超参数 yaml/json"
         if cfg.get("in_dim", -1) is None or cfg.get("in_dim", -1) <= 0:
             df = read_csv_smart(args.csv_path)
             feat_col = resolve_feat_path_col(df, cfg.get("feat_path_col"))
@@ -1035,6 +1434,7 @@ def main():
     )
     cfg["feat_path_col"] = feat_col
     cfg["n_classes"] = 2
+    cfg["stratify_by"] = normalize_stratify_by(cfg.get("stratify_by", "Molecular_label"))
     if cfg["in_dim"] is None or cfg["in_dim"] <= 0:
         all_paths = [p for ps in pt["feat_paths"] for p in ps]
         cfg["in_dim"] = detect_in_dim(all_paths, cfg["feat_key"])
@@ -1042,14 +1442,12 @@ def main():
         f"患者数: {len(pt)}, pCR(1)={int((pt['y'] == 1).sum())}, "
         f"N-pCR(0)={int((pt['y'] == 0).sum())}, "
         f"特征维度: {cfg['in_dim']}, n_classes: {cfg['n_classes']}, "
-        f"临床列: {clinical_cols}, fusion: {cfg.get('fusion_type', 'concat')}"
+        f"临床列: {clinical_cols}, fusion: {cfg.get('fusion_type', 'concat')}, "
+        f"stratify_by: {cfg.get('stratify_by')}"
     )
 
     log_dir = os.path.join(args.log_root, args.exp_name)
-    os.makedirs(log_dir, exist_ok=True)
-    with open(os.path.join(log_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-    print(f"超参数已保存到 {os.path.join(log_dir, 'config.json')}")
+    save_run_config(cfg, log_dir)
 
     if cfg["split_mode"] == "kfold":
         train_kfold(pt, cfg, device, log_dir)

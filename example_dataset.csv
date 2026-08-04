@@ -1,5 +1,5 @@
-case_id,slide_id,slide_feats_path,label,T,N,Age,ER,PR,HER2,Ki67
-10-12345,10-12345-1,slide_feats/10-12345-1.pt,N-pCR,1,2,50,90,90,0,10
-10-12346,10-12346-1,slide_feats/10-12346-1.pt,pCR,2,0,49,0,0,2,60
-10-12347,10-12347-2,slide_feats/10-12347-2.pt,N-pCR,3,1,50,90,90,1,10
-10-12348,10-12348-1,slide_feats/10-12348-1.pt,pCR,4,3,49,0,0,3,60
+case_id,slide_id,slide_feats_path,label,Molecular,T,N,Age,ER,PR,HER2,Ki67
+10-12345,10-12345-1,slide_feats/10-12345-1.pt,N-pCR,HR+HER2-,1,2,50,90,90,0,10
+10-12346,10-12346-1,slide_feats/10-12346-1.pt,pCR,TNBC,2,0,49,0,0,0,60
+10-12347,10-12347-2,slide_feats/10-12347-2.pt,N-pCR,HR+HER2+,3,1,50,90,90,3,10
+10-12348,10-12348-1,slide_feats/10-12348-1.pt,pCR,HER2,4,3,49,0,0,3,60
