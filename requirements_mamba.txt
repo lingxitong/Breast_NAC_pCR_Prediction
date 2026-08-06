@@ -1,0 +1,16 @@
+# mamba_mil / trans_mil / s4model 额外依赖
+# 建议：CUDA 11.8 + Python 3.10 + PyTorch 2.0.x（与上游 MambaMIL 一致）
+# 安装顺序见 scripts/install_mamba.sh
+
+packaging
+ninja
+einops
+triton
+# TransMIL / S4MIL
+opt_einsum
+
+# causal-conv1d 与本地编译的 mamba_ssm 需匹配 CUDA/Torch
+# 上游推荐：
+#   pip install causal-conv1d==1.1.1
+#   cd MambaMIL/mamba && pip install .
+causal-conv1d==1.1.1

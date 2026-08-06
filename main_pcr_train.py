@@ -479,12 +479,8 @@ def build_backbone(cfg):
         return MeanMaxBackbone(cfg["in_dim"], dropout=cfg["drop_out"],
                                hidden=cfg["hidden_dim"], pool="max")
     if mt in ("mamba_mil", "trans_mil", "s4model"):
-        if cfg.get("use_clinical", True) or cfg.get("clinical_only", False):
-            raise NotImplementedError(
-                f"临床融合/仅临床模式暂不支持 model_type={mt}，请使用 abmil/mean_mil/max_mil，"
-                f"或设置 --modality pathology"
-            )
-        return _build_repo_model(cfg)
+        # 作为特征 backbone：输出 bag 表征，供 pathomic 中期融合 / pathology 分类头使用
+        return _build_repo_backbone(cfg)
     raise NotImplementedError(f"未知 model_type: {mt}")
 
 
@@ -503,65 +499,146 @@ def build_model(cfg, device):
         )
         return model.to(device)
 
-    if cfg["model_type"] in ("mamba_mil", "trans_mil", "s4model") and modality == "pathology":
-        model = build_backbone(cfg)
-    else:
-        backbone = build_backbone(cfg)
-        use_clinical = (modality == "pathomic") and clinical_in_dim > 0
-        model = PathomicClassificationModel(
-            backbone, cfg["n_classes"], clinical_in_dim,
-            fusion_type=cfg.get("fusion_type", "concat"),
-            hidden_dim=cfg["hidden_dim"],
-            dropout=cfg["drop_out"],
-            use_clinical=use_clinical,
-        )
+    backbone = build_backbone(cfg)
+    use_clinical = (modality == "pathomic") and clinical_in_dim > 0
+    model = PathomicClassificationModel(
+        backbone, cfg["n_classes"], clinical_in_dim,
+        fusion_type=cfg.get("fusion_type", "concat"),
+        hidden_dim=cfg["hidden_dim"],
+        dropout=cfg["drop_out"],
+        use_clinical=use_clinical,
+    )
     return model.to(device)
 
 
-def _build_repo_model(cfg):
-    """从 MambaMIL 仓库动态构建模型（仅 path-only，无临床融合）。"""
+class RepoMILBackbone(nn.Module):
+    """
+    将 MambaMIL / TransMIL / S4MIL 截到分类头之前，输出 bag 级表征 [1, 512]。
+    可被 PathomicClassificationModel 接上临床中期融合。
+    """
+
+    REPO_HIDDEN = 512
+
+    def __init__(self, inner, model_type):
+        super().__init__()
+        self.model = inner
+        self.model_type = model_type
+        self.hidden_dim = self.REPO_HIDDEN
+
+    def forward(self, x):
+        mt = self.model_type
+        if mt == "mamba_mil":
+            return self._encode_mamba(x)
+        if mt == "trans_mil":
+            return self._encode_trans(x)
+        if mt == "s4model":
+            return self._encode_s4(x)
+        raise NotImplementedError(f"RepoMILBackbone 不支持 model_type={mt}")
+
+    def _encode_mamba(self, x):
+        m = self.model
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        h = m._fc1(x.float())
+        if m.type == "SRMamba":
+            for layer in m.layers:
+                h_ = h
+                h = layer[0](h)
+                h = layer[1](h, rate=m.rate)
+                h = h + h_
+        else:  # Mamba / BiMamba
+            for layer in m.layers:
+                h_ = h
+                h = layer[0](h)
+                h = layer[1](h)
+                h = h + h_
+        h = m.norm(h)
+        A = m.attention(h)
+        A = torch.transpose(A, 1, 2)
+        A = F.softmax(A, dim=-1)
+        h = torch.bmm(A, h)  # [B, 1, 512]
+        if h.size(0) == 1:
+            h = h.squeeze(0)  # [1, 512]
+        return h
+
+    def _encode_trans(self, x):
+        import numpy as _np
+
+        m = self.model
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        h = m._fc1(x.float())
+        H = h.shape[1]
+        _H, _W = int(_np.ceil(_np.sqrt(H))), int(_np.ceil(_np.sqrt(H)))
+        add_length = _H * _W - H
+        if add_length > 0:
+            h = torch.cat([h, h[:, :add_length, :]], dim=1)
+        cls_tokens = m.cls_token.expand(h.size(0), -1, -1).to(device=h.device, dtype=h.dtype)
+        h = torch.cat((cls_tokens, h), dim=1)
+        h = m.layer1(h)
+        h = m.pos_layer(h, _H, _W)
+        h = m.layer2(h)
+        h = m.norm(h)[:, 0]  # [B, 512]
+        if h.dim() == 1:
+            h = h.unsqueeze(0)
+        return h
+
+    def _encode_s4(self, x):
+        m = self.model
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        h = m._fc1(x.float())
+        h = m.s4_block(h)
+        h = torch.max(h, dim=1).values  # [B, 512]
+        if h.dim() == 1:
+            h = h.unsqueeze(0)
+        return h
+
+
+def _build_repo_backbone(cfg):
+    """从同级 MambaMIL 仓库构建特征 backbone（输出 512-d bag 表征）。"""
     import sys
 
-    # 可选依赖：与本脚本同级的 MambaMIL 目录
     repo_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MambaMIL")
     repo_root = os.path.abspath(repo_root)
+    if not os.path.isdir(repo_root):
+        raise RuntimeError(
+            f"未找到 MambaMIL 目录: {repo_root}\n"
+            f"本仓库应自带 vendored 的 MambaMIL/；若缺失请恢复该目录或从 "
+            f"https://github.com/isyangshu/MambaMIL 重新放入脚本同级。"
+        )
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
     mt = cfg["model_type"]
 
-    class RepoClsWrapper(nn.Module):
-        def __init__(self, inner):
-            super().__init__()
-            self.model = inner
-
-        def forward(self, x, clinical=None):
-            out = self.model(x)
-            # 兼容 (logits, ...) 或纯 logits
-            if isinstance(out, (tuple, list)):
-                return out[0]
-            return out
-
     try:
         if mt == "mamba_mil":
             from models.MambaMIL import MambaMIL
-            m = MambaMIL(in_dim=cfg["in_dim"], n_classes=cfg["n_classes"],
-                         dropout=cfg["drop_out"], act="gelu", survival=False,
-                         layer=cfg["mambamil_layer"], rate=cfg["mambamil_rate"],
-                         type=cfg["mambamil_type"])
+            inner = MambaMIL(
+                in_dim=cfg["in_dim"], n_classes=cfg["n_classes"],
+                dropout=cfg["drop_out"], act="gelu", survival=False,
+                layer=cfg["mambamil_layer"], rate=cfg["mambamil_rate"],
+                type=cfg["mambamil_type"],
+            )
         elif mt == "trans_mil":
             from models.TransMIL import TransMIL
-            m = TransMIL(cfg["in_dim"], cfg["n_classes"], dropout=cfg["drop_out"],
-                         act="relu", survival=False)
+            inner = TransMIL(
+                cfg["in_dim"], cfg["n_classes"], dropout=cfg["drop_out"],
+                act="relu", survival=False,
+            )
         else:
             from models.S4MIL import S4Model
-            m = S4Model(in_dim=cfg["in_dim"], n_classes=cfg["n_classes"], act="gelu",
-                        dropout=cfg["drop_out"], survival=False)
+            inner = S4Model(
+                in_dim=cfg["in_dim"], n_classes=cfg["n_classes"], act="gelu",
+                dropout=cfg["drop_out"], survival=False,
+            )
     except Exception as e:
         raise RuntimeError(
-            f"无法从 MambaMIL 仓库加载模型 '{mt}'（可能缺少依赖）。"
-            f"可改用 model_type=abmil。原始错误: {e}"
+            f"无法加载模型 '{mt}'。请先安装 Mamba 依赖：\n"
+            f"  bash scripts/install_mamba.sh\n"
+            f"或改用 model_type=abmil。原始错误: {e}"
         )
-    return RepoClsWrapper(m)
+    return RepoMILBackbone(inner, mt)
 
 
 # ============================================================================

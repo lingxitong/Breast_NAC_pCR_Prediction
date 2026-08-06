@@ -1,0 +1,7 @@
+# 基础依赖（abmil / mean_mil / max_mil / clinical 模式）
+torch
+numpy
+pandas
+pyyaml
+scikit-learn
+h5py

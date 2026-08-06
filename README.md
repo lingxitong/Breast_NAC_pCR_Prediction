@@ -7,6 +7,9 @@
 | [`main_pcr_train.py`](main_pcr_train.py) | **训练**入口 |
 | [`main_pcr_infer.py`](main_pcr_infer.py) | **推理**入口 |
 | [`make_kfold_splits.py`](make_kfold_splits.py) | 独立 K 折划分（唯一划分入口） |
+| [`MambaMIL/`](MambaMIL/) | vendored [MambaMIL](https://github.com/isyangshu/MambaMIL)（`mamba_mil` / `trans_mil` / `s4model`） |
+| [`requirements.txt`](requirements.txt) | 基础依赖 |
+| [`requirements_mamba.txt`](requirements_mamba.txt) / [`scripts/install_mamba.sh`](scripts/install_mamba.sh) | Mamba CUDA 扩展安装 |
 | [`example_dataset.csv`](example_dataset.csv) | 示例数据 |
 | [`Feature_dict.json`](Feature_dict.json) | 字段说明 |
 
@@ -165,6 +168,17 @@ slide bag → MIL → 全局表征 ─┐
 ```
 
 `--fusion_type`：`concat` / `bilinear` / `gated`（仅 pathomic）
+
+`mamba_mil` / `trans_mil` / `s4model` 同样可作为 MIL backbone 接临床中期融合（内部表征维固定 512）。源码已 vendored 于 [`MambaMIL/`](MambaMIL/)；首次使用前需编译安装 CUDA 扩展：
+
+```bash
+# 建议环境与上游一致：CUDA 11.8 / Python 3.10 / PyTorch 2.0.x
+pip install -r requirements.txt
+bash scripts/install_mamba.sh
+# 或：pip install -r requirements_mamba.txt && pip install ./MambaMIL/mamba
+```
+
+仅临床模式 `modality=clinical` 仍走独立 MLP，与 `model_type` 无关。
 
 ### 主要超参数
 
