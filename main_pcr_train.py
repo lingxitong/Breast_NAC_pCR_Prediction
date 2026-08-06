@@ -3,14 +3,15 @@
 """
 main_pcr.py
 ===========
-基于 BreastRCB-Prognosis 中期融合框架改造的乳腺新辅助治疗 pCR 二分类单脚本。
+基于 BreastRCB-Prognosis 中期融合框架改造的乳腺新辅助治疗 pCR 二分类训练脚本。
 
 任务：
   * 标签映射：N-pCR -> 0，pCR -> 1
   * 损失：CrossEntropy
-  * 评价：AUC / Accuracy / F1 / Sensitivity / Specificity
+  * 评价：AUC / AUPRC / Accuracy / Balanced Acc / F1 / Precision / Recall
+    （Sensitivity）/ Specificity / PPV / NPV / MCC，以及 TP/TN/FP/FN
   * 一个患者(case)可能有多张 slide，训练时拼接成一个 bag；若 slide 数 > max_slides
-    则随机选取 max_slides 张拼接；推理时拼接全部 slide。
+    则随机选取 max_slides 张拼接；验证时拼接全部 slide。
 
 输入 CSV 格式见项目根目录 example_dataset.csv，关键列：
   case_id, slide_id, slide_feats_path, label,
@@ -22,9 +23,11 @@ slide_feats_path 指向每张 slide 的特征文件（.pt 或 .h5）。
   连续变量（标准化）：Age, ER, PR, Ki67
 Molecular 取值（四种）：HR+HER2- / HR+HER2+ / TNBC / HER2。
 
-支持运行模式（--mode）:
-  train  : 训练。--split_mode 控制 kfold（默认）或 all_train。
-  infer  : 推理。给定超参 yaml/json + 权重 + csv，输出指标和每个患者的预测概率。
+训练：
+  * --split_mode 控制 kfold（默认）或 all_train。
+  * 结束后保存验证集逐样本概率，并按 Molecular 输出总体/亚组指标。
+  * 早停（有验证集时）：--early_stop/--no-early_stop、--patience、
+    --min_delta、--early_stop_metric（默认 val_auc）。
 
 模态（--modality）:
   pathomic  : WSI MIL + 临床中期融合（默认）
@@ -33,31 +36,28 @@ Molecular 取值（四种）：HR+HER2- / HR+HER2+ / TNBC / HER2。
 
 K 折划分：
   * 必须先用独立脚本 make_kfold_splits.py 生成划分；
-  * 训练（split_mode=kfold）强制通过 --splits_path 加载预划分，
-    main_pcr.py 内不再做现场/临时划分。
+  * 训练强制依赖 --splits_path（预划分结果）；CSV 路径从划分文件
+    meta.csv_path 读取，不再单独要求 --csv_path。
+  * main_pcr.py 内不再做现场/临时划分。
+  * 亚组专训（splits 来自 molecular_subgroups/<Molecular>/）时，若能定位到父级
+    总体划分，会额外在总体验证集上评估，并输出总体指标 + 各 Molecular 亚组指标。
 
-超参数：训练时以 config.yaml 写入日志目录；推理 --config 支持 yaml/json。
+超参数：训练时以 config.yaml 写入日志目录；可用 --config 覆盖。
 
 示例（在项目根目录执行）：
-  # 1) 先划分（唯一划分入口）
+  # 1) 先划分（唯一划分入口；会把 csv_path 写入划分 meta）
   python make_kfold_splits.py --csv_path example_dataset.csv \\
       --out_dir ./splits/mol_label_k5 --k 5 --stratify_by Molecular_label
 
-  # 2) 基于预划分训练（病理+临床）；必须提供 --splits_path
-  python main_pcr.py --mode train --split_mode kfold \\
-      --csv_path example_dataset.csv \\
+  # 2) 基于预划分训练（病理+临床）
+  python main_pcr.py --split_mode kfold \\
       --splits_path ./splits/mol_label_k5/kfold_splits.yaml \\
       --log_root ./logs --exp_name pcr_kfold
 
   # 3) 仅临床信息训练
-  python main_pcr.py --mode train --split_mode kfold --clinical_only \\
-      --csv_path example_dataset.csv \\
+  python main_pcr.py --split_mode kfold --clinical_only \\
       --splits_path ./splits/mol_label_k5/kfold_splits.yaml \\
       --log_root ./logs --exp_name pcr_clinical_only
-
-  python main_pcr.py --mode infer --config ./logs/pcr_kfold/config.yaml \\
-      --ckpt_path ./logs/pcr_kfold/fold_0/checkpoint_best.pt \\
-      --csv_path test.csv --save_infer_dir ./infer_pcr
 """
 
 from __future__ import print_function
@@ -75,11 +75,23 @@ import torch.nn.functional as F
 import yaml
 from sklearn.metrics import (
     accuracy_score,
-    f1_score,
-    roc_auc_score,
+    average_precision_score,
+    balanced_accuracy_score,
     confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    roc_auc_score,
 )
 from sklearn.model_selection import StratifiedKFold, KFold
+
+# 写入 metrics.csv / 日志的逐 epoch 指标键（run_epoch 返回值中的键名）
+EPOCH_METRIC_KEYS = (
+    "loss", "auc", "auprc", "acc", "balanced_acc",
+    "f1", "precision", "recall", "sensitivity", "specificity",
+    "ppv", "npv", "mcc", "tp", "tn", "fp", "fn",
+)
 
 try:
     import h5py
@@ -149,15 +161,23 @@ def load_config_file(path):
 # 超参数 / 列约定
 # ----------------------------------------------------------------------------
 HPARAM_KEYS = [
-    "k", "split_mode", "stratify_by", "splits_path", "n_classes",
+    "k", "split_mode", "stratify_by", "splits_path", "csv_path", "n_classes",
     "max_epochs", "lr", "reg",
     "drop_out", "gc", "seed", "opt", "model_type", "in_dim",
     "hidden_dim", "max_slides_train", "feat_key", "num_workers",
+    "early_stop", "patience", "min_delta", "early_stop_metric",
     "mambamil_layer", "mambamil_rate", "mambamil_type",
     "modality", "clinical_only", "use_clinical",
     "fusion_type", "clinical_hidden_dim", "clinical_in_dim",
     "label_col", "feat_path_col",
 ]
+
+# 早停监控指标
+EARLY_STOP_METRIC_CHOICES = (
+    "val_auc", "val_auprc", "val_loss", "val_acc", "val_balanced_acc",
+    "val_f1", "val_precision", "val_recall", "val_sensitivity",
+    "val_specificity", "val_mcc",
+)
 
 # K 折分层依据（写入 config.yaml / kfold_splits.yaml 的 stratify_by）
 STRATIFY_BY_CHOICES = ("Molecular_label", "Molecular", "label", "none")
@@ -879,7 +899,19 @@ def model_forward(model, feats, clinical, cfg, device):
 # ============================================================================
 # 指标
 # ============================================================================
+def _safe_div(num, den):
+    return float(num / den) if den > 0 else float("nan")
+
+
 def compute_cls_metrics(y_true, y_prob, y_pred=None, thr=0.5):
+    """
+    二分类指标（正类=pCR=1）。
+    返回字段：
+      n/n_pos/n_neg, tp/tn/fp/fn,
+      auc, auprc, acc, balanced_acc,
+      f1, precision, recall(=sensitivity), specificity,
+      ppv(=precision), npv, mcc
+    """
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob).astype(float)
     if y_pred is None:
@@ -887,31 +919,238 @@ def compute_cls_metrics(y_true, y_prob, y_pred=None, thr=0.5):
     else:
         y_pred = np.asarray(y_pred).astype(int)
 
+    n = int(len(y_true))
     metrics = {
-        "n": int(len(y_true)),
-        "n_pos": int(np.sum(y_true == 1)),
-        "n_neg": int(np.sum(y_true == 0)),
-        "acc": float(accuracy_score(y_true, y_pred)) if len(y_true) else float("nan"),
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)) if len(y_true) else float("nan"),
+        "n": n,
+        "n_pos": int(np.sum(y_true == 1)) if n else 0,
+        "n_neg": int(np.sum(y_true == 0)) if n else 0,
+        "tp": 0, "tn": 0, "fp": 0, "fn": 0,
+        "auc": float("nan"),
+        "auprc": float("nan"),
+        "acc": float("nan"),
+        "balanced_acc": float("nan"),
+        "f1": float("nan"),
+        "precision": float("nan"),
+        "recall": float("nan"),
+        "sensitivity": float("nan"),
+        "specificity": float("nan"),
+        "ppv": float("nan"),
+        "npv": float("nan"),
+        "mcc": float("nan"),
     }
-    # AUC 需要两类都存在
+    if n == 0:
+        return metrics
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    metrics.update({
+        "tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn),
+        "acc": float(accuracy_score(y_true, y_pred)),
+        "balanced_acc": float(balanced_accuracy_score(y_true, y_pred)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "mcc": float(matthews_corrcoef(y_true, y_pred)) if len(np.unique(y_true)) >= 2 else float("nan"),
+    })
+    # sensitivity = recall（正类召回）；specificity；PPV/NPV
+    metrics["sensitivity"] = metrics["recall"]
+    metrics["specificity"] = _safe_div(tn, tn + fp)
+    metrics["ppv"] = metrics["precision"]
+    metrics["npv"] = _safe_div(tn, tn + fn)
+
+    # AUC / AUPRC 需要正负类都存在
     if len(np.unique(y_true)) >= 2:
         metrics["auc"] = float(roc_auc_score(y_true, y_prob))
-    else:
-        metrics["auc"] = float("nan")
-
-    if len(y_true):
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-        metrics["sensitivity"] = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
-        metrics["specificity"] = float(tn / (tn + fp)) if (tn + fp) > 0 else float("nan")
-    else:
-        metrics["sensitivity"] = float("nan")
-        metrics["specificity"] = float("nan")
+        metrics["auprc"] = float(average_precision_score(y_true, y_prob))
     return metrics
 
 
+def prefix_epoch_metrics(metrics, prefix):
+    """将 run_epoch 指标扁平化为 train_*/val_* 列，用于 metrics.csv。"""
+    out = {}
+    for k in EPOCH_METRIC_KEYS:
+        if k in metrics:
+            out[f"{prefix}{k}"] = metrics[k]
+    return out
+
+
+def normalize_molecular_value(raw):
+    """将 Molecular 原始值规范化到预定义四类（无法识别则保留去空白字符串）。"""
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)) or pd.isna(raw):
+        return "missing"
+    s = str(raw).strip()
+    if not s:
+        return "missing"
+    aliases = {
+        "hr+her2-": "HR+HER2-",
+        "hr+her2+": "HR+HER2+",
+        "tnbc": "TNBC",
+        "her2": "HER2",
+        "her2+": "HER2",
+        "her2 enriched": "HER2",
+        "her2-positive": "HER2",
+        "triple negative": "TNBC",
+        "luminal": "HR+HER2-",
+        "luminal a": "HR+HER2-",
+        "luminal b": "HR+HER2-",
+        "luminal her2+": "HR+HER2+",
+        "hr+": "HR+HER2-",
+    }
+    mapped = aliases.get(s.lower())
+    if mapped is not None:
+        return mapped
+    for cat in MOLECULAR_CATEGORIES:
+        if s == cat:
+            return cat
+    return s
+
+
+def compute_metrics_with_subgroups(pred_df, thr=0.5, molecular_cats=None):
+    """
+    基于预测表计算总体指标 + 各 Molecular 亚组指标。
+    pred_df 需含列: label, prob_pCR；可选 Molecular / pred。
+    """
+    if pred_df is None or len(pred_df) == 0:
+        empty = compute_cls_metrics([], [], [])
+        cats = list(molecular_cats or MOLECULAR_CATEGORIES)
+        return {
+            "overall": empty,
+            "by_molecular": {c: compute_cls_metrics([], [], []) for c in cats},
+        }
+
+    df = pred_df.copy()
+    if "pred" not in df.columns:
+        df["pred"] = (df["prob_pCR"].astype(float) >= thr).astype(int)
+    if "Molecular" in df.columns:
+        df["Molecular"] = df["Molecular"].map(normalize_molecular_value)
+    else:
+        df["Molecular"] = "missing"
+
+    overall = compute_cls_metrics(df["label"], df["prob_pCR"], df["pred"], thr=thr)
+    cats = list(molecular_cats or MOLECULAR_CATEGORIES)
+    # 保证四类都有条目；额外出现的类别也一并报告
+    extra = [c for c in sorted(df["Molecular"].unique()) if c not in cats]
+    by_mol = {}
+    for cat in cats + extra:
+        sub = df[df["Molecular"] == cat]
+        by_mol[cat] = compute_cls_metrics(
+            sub["label"], sub["prob_pCR"], sub["pred"] if len(sub) else None, thr=thr
+        )
+    return {"overall": overall, "by_molecular": by_mol}
+
+
+def save_prediction_outputs(out_dir, pred_df, prefix="val", extra_meta=None):
+    """保存逐样本预测 CSV + 总体/亚组指标 JSON/YAML。"""
+    os.makedirs(out_dir, exist_ok=True)
+    pred_path = os.path.join(out_dir, f"{prefix}_predictions.csv")
+    metrics_json = os.path.join(out_dir, f"{prefix}_metrics.json")
+    metrics_yaml = os.path.join(out_dir, f"{prefix}_metrics.yaml")
+
+    if pred_df is None or len(pred_df) == 0:
+        empty_df = pd.DataFrame(
+            columns=["case_id", "label", "Molecular", "prob_pCR", "pred"]
+        )
+        empty_df.to_csv(pred_path, index=False)
+        metrics = compute_metrics_with_subgroups(empty_df)
+    else:
+        out_df = pred_df.copy()
+        if "Molecular" in out_df.columns:
+            out_df["Molecular"] = out_df["Molecular"].map(normalize_molecular_value)
+        cols = [c for c in ["case_id", "label", "Molecular", "prob_pCR", "pred", "fold"]
+                if c in out_df.columns]
+        out_df[cols].to_csv(pred_path, index=False)
+        metrics = compute_metrics_with_subgroups(out_df)
+
+    if extra_meta:
+        metrics = dict(metrics)
+        metrics.update(extra_meta)
+
+    with open(metrics_json, "w", encoding="utf-8") as f:
+        json.dump(_to_builtin(metrics), f, ensure_ascii=False, indent=2)
+    save_yaml(metrics, metrics_yaml)
+    return pred_path, metrics
+
+
+def _fmt_metric(m, key, nd=4):
+    v = m.get(key, float("nan"))
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "nan"
+    if v != v:
+        return "nan"
+    return f"{v:.{nd}f}"
+
+
+def print_metrics_block(title, metrics_bundle):
+    """打印总体 + 亚组指标摘要。"""
+    overall = metrics_bundle.get("overall", {})
+    print(
+        f"{title} overall: n={overall.get('n', 0)}, "
+        f"AUC={_fmt_metric(overall, 'auc')}, AUPRC={_fmt_metric(overall, 'auprc')}, "
+        f"ACC={_fmt_metric(overall, 'acc')}, bACC={_fmt_metric(overall, 'balanced_acc')}, "
+        f"F1={_fmt_metric(overall, 'f1')}, "
+        f"P={_fmt_metric(overall, 'precision')}, R={_fmt_metric(overall, 'recall')}, "
+        f"Spec={_fmt_metric(overall, 'specificity')}, MCC={_fmt_metric(overall, 'mcc')}"
+    )
+    print(
+        f"  confusion: TP={overall.get('tp', 0)} TN={overall.get('tn', 0)} "
+        f"FP={overall.get('fp', 0)} FN={overall.get('fn', 0)} "
+        f"PPV={_fmt_metric(overall, 'ppv')} NPV={_fmt_metric(overall, 'npv')}"
+    )
+    by_mol = metrics_bundle.get("by_molecular", {})
+    for cat in MOLECULAR_CATEGORIES:
+        m = by_mol.get(cat)
+        if not m or int(m.get("n", 0) or 0) == 0:
+            continue
+        print(
+            f"  [{cat}] n={m['n']} AUC={_fmt_metric(m, 'auc')} "
+            f"AUPRC={_fmt_metric(m, 'auprc')} ACC={_fmt_metric(m, 'acc')} "
+            f"F1={_fmt_metric(m, 'f1')} P={_fmt_metric(m, 'precision')} "
+            f"R={_fmt_metric(m, 'recall')} Spec={_fmt_metric(m, 'specificity')} "
+            f"MCC={_fmt_metric(m, 'mcc')}"
+        )
+
+
+def resolve_overall_splits_path(splits_path, explicit=None):
+    """
+    解析亚组专训对应的总体划分路径。
+    优先 explicit；否则若当前划分位于 molecular_subgroups/<name>/ 下，
+    自动上溯到父目录的 kfold_splits.yaml。
+    """
+    if explicit:
+        try:
+            return resolve_splits_path(explicit, required=True)
+        except Exception as e:
+            print(f"警告: 无法解析 --eval_overall_splits={explicit}: {e}")
+            return None
+    if not splits_path:
+        return None
+    path = os.path.abspath(str(splits_path))
+    base = path if os.path.isdir(path) else os.path.dirname(path)
+    # .../molecular_subgroups/<Molecular>/[kfold_splits.yaml]
+    parts = base.rstrip(os.sep).split(os.sep)
+    if "molecular_subgroups" in parts:
+        idx = parts.index("molecular_subgroups")
+        parent_dir = os.sep.join(parts[:idx])
+        for name in ("kfold_splits.yaml", "kfold_splits.yml", "kfold_splits.json"):
+            cand = os.path.join(parent_dir, name)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def is_subgroup_split_meta(split_meta):
+    if not isinstance(split_meta, dict):
+        return False
+    if str(split_meta.get("split_type", "")).lower() == "subgroup":
+        return True
+    if split_meta.get("subgroup"):
+        return True
+    return False
+
+
 # ============================================================================
-# 训练 / 验证 / 推理
+# 训练 / 验证
 # ============================================================================
 def run_epoch(model, loader, optimizer, cfg, device, train=True):
     model.train() if train else model.eval()
@@ -951,6 +1190,83 @@ def run_epoch(model, loader, optimizer, cfg, device, train=True):
     return metrics
 
 
+@torch.no_grad()
+def predict_patient_table(model, pt_df, cfg, device, clinical_encoder=None):
+    """对患者表逐例评估预测，返回含 case_id/label/Molecular/prob_pCR/pred 的 DataFrame。"""
+    if pt_df is None or len(pt_df) == 0:
+        return pd.DataFrame(
+            columns=["case_id", "label", "Molecular", "prob_pCR", "pred"]
+        )
+    model.eval()
+    modality = normalize_modality(cfg)
+    loader = make_loader(pt_df, cfg, training=False, clinical_encoder=clinical_encoder)
+    mol_map = {}
+    if "Molecular" in pt_df.columns:
+        for _, row in pt_df.iterrows():
+            mol_map[str(row["case_id"])] = normalize_molecular_value(row["Molecular"])
+
+    rows = []
+    for feats, clinical, label, cid in loader:
+        if modality != "clinical":
+            feats = feats.to(device, non_blocking=True)
+        logits = model_forward(model, feats, clinical, cfg, device)
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        prob1 = float(torch.softmax(logits, dim=-1)[0, 1].detach().cpu().item())
+        pred = int(torch.argmax(logits, dim=-1).detach().cpu().item())
+        rows.append({
+            "case_id": str(cid),
+            "label": int(label),
+            "Molecular": mol_map.get(str(cid), "missing"),
+            "prob_pCR": prob1,
+            "pred": pred,
+        })
+    return pd.DataFrame(rows)
+
+
+def load_model_for_eval(cfg, device, ckpt_path, encoder=None):
+    """构建模型并加载权重；按需根据 encoder 设置 clinical_in_dim。"""
+    cfg = dict(cfg)
+    modality = normalize_modality(cfg)
+    if encoder is not None:
+        cfg["clinical_in_dim"] = int(encoder.output_dim)
+    elif modality in ("pathomic", "clinical"):
+        cfg.setdefault("clinical_in_dim", int(cfg.get("clinical_in_dim", 0) or 0))
+    model = build_model(cfg, device)
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    return model, cfg
+
+
+def resolve_ckpt_path(fold_dir, prefer_best=True, preferred_name=None):
+    """在 fold 目录中寻找可用权重。"""
+    candidates = []
+    if preferred_name:
+        candidates.append(preferred_name)
+    if prefer_best:
+        candidates.extend([
+            "checkpoint_best.pt",
+            "checkpoint_best_loss.pt",
+            "checkpoint_last.pt",
+        ])
+    else:
+        candidates.extend([
+            "checkpoint_last.pt",
+            "checkpoint_best.pt",
+            "checkpoint_best_loss.pt",
+        ])
+    seen = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        path = os.path.join(fold_dir, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
     """训练单个 run（一个 fold 或 all_train）。返回该 run 的历史与最佳信息。"""
     os.makedirs(out_dir, exist_ok=True)
@@ -972,34 +1288,72 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
     ckpt_best_loss = os.path.join(out_dir, "checkpoint_best_loss.pt")
     ckpt_last = os.path.join(out_dir, "checkpoint_last.pt")
 
+    # 早停：仅在有验证集时生效
+    early_stop = bool(cfg.get("early_stop", True)) and (val_loader is not None)
+    patience = max(1, int(cfg.get("patience", 10)))
+    min_delta = float(cfg.get("min_delta", 0.0))
+    stop_metric = str(cfg.get("early_stop_metric", "val_auc") or "val_auc").strip().lower()
+    if stop_metric not in EARLY_STOP_METRIC_CHOICES:
+        print(f"警告: 未知 early_stop_metric={stop_metric!r}，回退为 val_auc")
+        stop_metric = "val_auc"
+    # loss 越小越好；其余指标越大越好
+    maximize = stop_metric != "val_loss"
+    best_monitor = -float("inf") if maximize else float("inf")
+    bad_epochs = 0
+    early_stopped = False
+    stopped_epoch = None
+
+    if early_stop:
+        print(
+            f"[{fold_tag}] 早停已启用: metric={stop_metric}, "
+            f"patience={patience}, min_delta={min_delta}"
+        )
+    elif val_loader is None and bool(cfg.get("early_stop", True)):
+        print(f"[{fold_tag}] 无验证集，跳过早停（all_train）")
+
     for epoch in range(cfg["max_epochs"]):
         tr = run_epoch(model, train_loader, optimizer, cfg, device, train=True)
-        rec = {
-            "epoch": epoch,
-            "train_loss": tr["loss"],
-            "train_auc": tr["auc"],
-            "train_acc": tr["acc"],
-            "train_f1": tr["f1"],
-        }
+        rec = {"epoch": epoch}
+        rec.update(prefix_epoch_metrics(tr, "train_"))
         if val_loader is not None:
             va = run_epoch(model, val_loader, optimizer, cfg, device, train=False)
-            rec.update({
-                "val_loss": va["loss"],
-                "val_auc": va["auc"],
-                "val_acc": va["acc"],
-                "val_f1": va["f1"],
-                "val_sensitivity": va["sensitivity"],
-                "val_specificity": va["specificity"],
-            })
-            # 优先按 val AUC 选模；AUC 不可用时回退到 val ACC
+            rec.update(prefix_epoch_metrics(va, "val_"))
+            # 选模仍优先按 val AUC；AUC 不可用时回退到 val ACC
             score = va["auc"] if va["auc"] == va["auc"] else va["acc"]
             if score == score and score > best_auc:
                 best_auc, best_epoch = float(score), epoch
                 torch.save(model.state_dict(), ckpt_best)
+
+            # 早停监控（va 字典键无 val_ 前缀）
+            if early_stop:
+                metric_key = (
+                    stop_metric[4:] if stop_metric.startswith("val_") else stop_metric
+                )
+                monitor = va.get(metric_key, float("nan"))
+                improved = False
+                if monitor == monitor:  # not NaN
+                    if maximize:
+                        improved = monitor > (best_monitor + min_delta)
+                    else:
+                        improved = monitor < (best_monitor - min_delta)
+                if improved:
+                    best_monitor = float(monitor)
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+                rec["early_stop_monitor"] = (
+                    float(monitor) if monitor == monitor else None
+                )
+                rec["early_stop_bad_epochs"] = bad_epochs
+
             print(
                 f"[{fold_tag} epoch {epoch}] "
                 f"train_loss={tr['loss']:.4f} train_auc={tr['auc']:.4f} "
-                f"val_loss={va['loss']:.4f} val_auc={va['auc']:.4f} val_acc={va['acc']:.4f}"
+                f"val_loss={va['loss']:.4f} val_auc={va['auc']:.4f} "
+                f"val_acc={va['acc']:.4f} val_f1={va['f1']:.4f} "
+                f"val_P={va['precision']:.4f} val_R={va['recall']:.4f} "
+                f"val_spec={va['specificity']:.4f}"
+                + (f" bad={bad_epochs}/{patience}" if early_stop else "")
             )
         else:
             if tr["loss"] < best_loss:
@@ -1007,21 +1361,78 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
                 torch.save(model.state_dict(), ckpt_best_loss)
             print(
                 f"[{fold_tag} epoch {epoch}] "
-                f"train_loss={tr['loss']:.4f} train_auc={tr['auc']:.4f} train_acc={tr['acc']:.4f}"
+                f"train_loss={tr['loss']:.4f} train_auc={tr['auc']:.4f} "
+                f"train_acc={tr['acc']:.4f} train_f1={tr['f1']:.4f} "
+                f"train_P={tr['precision']:.4f} train_R={tr['recall']:.4f}"
             )
 
         history.append(rec)
+
+        if early_stop and bad_epochs >= patience:
+            early_stopped = True
+            stopped_epoch = epoch
+            print(
+                f"[{fold_tag}] 早停触发于 epoch {epoch} "
+                f"(metric={stop_metric}, best={best_monitor:.4f}, "
+                f"patience={patience}, best_ckpt_epoch={best_epoch})"
+            )
+            break
 
     torch.save(model.state_dict(), ckpt_last)
     pd.DataFrame(history).to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
     with open(os.path.join(out_dir, "history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+    early_stop_info = {
+        "enabled": bool(early_stop),
+        "metric": stop_metric if early_stop else None,
+        "patience": patience if early_stop else None,
+        "min_delta": min_delta if early_stop else None,
+        "best_monitor": (
+            float(best_monitor)
+            if early_stop and best_monitor not in (float("inf"), -float("inf"))
+            else None
+        ),
+        "early_stopped": bool(early_stopped),
+        "stopped_epoch": stopped_epoch,
+        "best_epoch": best_epoch,
+    }
+    with open(os.path.join(out_dir, "early_stop.json"), "w", encoding="utf-8") as f:
+        json.dump(_to_builtin(early_stop_info), f, ensure_ascii=False, indent=2)
+
+    # 用最佳权重对验证集做逐样本评估并落盘
+    val_pred_df = None
+    val_metrics = None
+    if pt_val is not None and len(pt_val) > 0:
+        ckpt_for_eval = ckpt_best if os.path.isfile(ckpt_best) else ckpt_last
+        eval_model, eval_cfg = load_model_for_eval(
+            cfg, device, ckpt_for_eval, encoder=encoder
+        )
+        val_pred_df = predict_patient_table(
+            eval_model, pt_val, eval_cfg, device, clinical_encoder=encoder
+        )
+        _, val_metrics = save_prediction_outputs(
+            out_dir, val_pred_df, prefix="val",
+            extra_meta={
+                "ckpt_path": os.path.abspath(ckpt_for_eval),
+                "best_epoch": best_epoch,
+                "split": "fold_val",
+                "early_stop": early_stop_info,
+            },
+        )
+        print_metrics_block(f"[{fold_tag}] val", val_metrics)
+
     return {
         "history": history,
         "best_epoch": best_epoch,
         "best_auc": best_auc if val_loader is not None else None,
         "best_loss": best_loss if val_loader is None else None,
+        "early_stop": early_stop_info,
+        "encoder": encoder,
+        "val_predictions": val_pred_df,
+        "val_metrics": val_metrics,
+        "ckpt_best": ckpt_best if os.path.isfile(ckpt_best) else None,
+        "ckpt_last": ckpt_last,
     }
 
 
@@ -1268,7 +1679,7 @@ def resolve_splits_path(splits_path, required=True):
     if splits_path is None or str(splits_path).strip() == "":
         if required:
             raise ValueError(
-                "kfold 训练必须提供 --splits_path（预划分结果）。"
+                "必须提供 --splits_path（预划分结果）。"
                 "请先运行: python make_kfold_splits.py --csv_path ... --out_dir ..."
             )
         return None
@@ -1287,13 +1698,70 @@ def resolve_splits_path(splits_path, required=True):
     return path
 
 
+def load_splits_meta(splits_path):
+    """
+    加载预划分文件的 meta（兼容顶层字段或嵌套 meta 块）。
+    返回 (resolved_splits_path, meta_dict, raw_data)。
+    """
+    path = resolve_splits_path(splits_path, required=True)
+    data = load_config_file(path)
+    meta = {k: v for k, v in data.items() if k != "folds"}
+    if isinstance(meta.get("meta"), dict):
+        nested = meta.pop("meta")
+        merged = dict(nested)
+        merged.update(meta)
+        meta = merged
+    return path, meta, data
+
+
+def resolve_csv_path_from_splits(splits_path, csv_override=None):
+    """
+    从预划分 meta.csv_path 解析数据 CSV。
+    若提供 csv_override 则优先使用（用于 CSV 搬迁后的兼容覆盖）。
+    """
+    if csv_override is not None and str(csv_override).strip():
+        path = os.path.abspath(str(csv_override))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"CSV 不存在: {path}")
+        return path
+
+    resolved, meta, _ = load_splits_meta(splits_path)
+    csv_path = meta.get("csv_path")
+    if csv_path is None or str(csv_path).strip() == "":
+        raise ValueError(
+            f"预划分文件缺少 meta.csv_path: {resolved}。"
+            f"请用 make_kfold_splits.py 重新生成，或用 --csv_path 临时覆盖。"
+        )
+    path = os.path.abspath(str(csv_path))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"预划分记录的 CSV 不存在: {path}\n"
+            f"  来源划分: {resolved}\n"
+            f"  可用 --csv_path 覆盖该路径。"
+        )
+    return path
+
+
+def resolve_runtime_splits_path(args, cfg=None):
+    """解析训练用预划分路径：优先 CLI --splits_path，其次 config.splits_path。"""
+    if getattr(args, "splits_path", None):
+        return resolve_splits_path(args.splits_path, required=True)
+
+    if cfg and cfg.get("splits_path"):
+        return resolve_splits_path(cfg.get("splits_path"), required=True)
+
+    raise ValueError(
+        "必须提供预划分结果：请指定 --splits_path。"
+        "请先运行 make_kfold_splits.py。"
+    )
+
+
 def load_kfold_splits(splits_path, pt):
     """
     从预划分文件加载 K 折索引。
     返回 (splits, split_meta, fold_records)，splits 为 [(train_idx, val_idx), ...]。
     """
-    path = resolve_splits_path(splits_path)
-    data = load_config_file(path)
+    path, meta, data = load_splits_meta(splits_path)
     if "folds" not in data or not data["folds"]:
         raise ValueError(f"划分文件缺少 folds: {path}")
 
@@ -1322,7 +1790,7 @@ def load_kfold_splits(splits_path, pt):
 
         # 用当前患者表重算分布，保证与本次 CSV 一致
         rebuilt = build_fold_split_record(
-            pt, fold, tr_idx, va_idx, rec.get("stratify_by", data.get("stratify_by"))
+            pt, fold, tr_idx, va_idx, rec.get("stratify_by", meta.get("stratify_by"))
         )
         fold_records.append(rebuilt)
 
@@ -1335,16 +1803,17 @@ def load_kfold_splits(splits_path, pt):
         print(f"警告: 当前 CSV 中有 {len(unused)} 个 case 未出现在划分中（将被忽略）: "
               f"{unused[:5]}{'...' if len(unused) > 5 else ''}")
 
-    meta = {k: v for k, v in data.items() if k != "folds"}
+    meta = dict(meta)
     meta["source_splits_path"] = path
     meta["loaded_from_file"] = True
     meta["k"] = len(splits)
     print(f"已从预划分加载 K 折: {path} (k={len(splits)}, "
-          f"stratify_by={meta.get('stratify_by')})")
+          f"stratify_by={meta.get('stratify_by')}, "
+          f"split_type={meta.get('split_type')}, subgroup={meta.get('subgroup')})")
     return splits, meta, fold_records
 
 
-def train_kfold(pt, cfg, device, log_dir):
+def train_kfold(pt, cfg, device, log_dir, eval_overall_splits=None):
     """K 折训练：强制从 --splits_path 加载预划分，不再现场划分。"""
     splits_path = resolve_splits_path(cfg.get("splits_path"), required=True)
     cfg["splits_path"] = splits_path
@@ -1358,12 +1827,35 @@ def train_kfold(pt, cfg, device, log_dir):
     split_meta["loaded_from_file"] = True
     split_meta["source_splits_path"] = splits_path
 
+    # 亚组专训：定位总体划分，便于在总体验证集上评估
+    subgroup_mode = is_subgroup_split_meta(split_meta)
+    overall_splits_path = resolve_overall_splits_path(
+        splits_path, explicit=eval_overall_splits
+    )
+    overall_splits = overall_fold_records = overall_split_meta = None
+    if overall_splits_path:
+        try:
+            overall_splits, overall_split_meta, overall_fold_records = load_kfold_splits(
+                overall_splits_path, pt
+            )
+            print(f"已加载总体划分用于评估: {overall_splits_path}")
+        except Exception as e:
+            print(f"警告: 加载总体划分失败，将跳过总体验证评估: {e}")
+            overall_splits = overall_fold_records = overall_split_meta = None
+    elif subgroup_mode:
+        print(
+            "提示: 当前为亚组专训，但未找到父级总体划分；"
+            "仅输出本亚组验证集指标。可用 --eval_overall_splits 指定总体 kfold_splits。"
+        )
+
     # 将划分副本写入本次实验日志，保证实验自包含
     save_kfold_splits(log_dir, split_meta, fold_records)
 
     fold_summaries = []
     best_epochs = []
     val_aucs = []
+    oof_frames = []
+    overall_eval_frames = []
 
     for fold, (tr_idx, va_idx) in enumerate(splits):
         print(f"\n========== Fold {fold} / {cfg['k']} ==========")
@@ -1381,7 +1873,8 @@ def train_kfold(pt, cfg, device, log_dir):
         res = train_one_run(pt_tr, pt_va, cfg, device, fold_dir, fold_tag=f"fold{fold}")
         best_epochs.append(res["best_epoch"])
         val_aucs.append(res["best_auc"])
-        fold_summaries.append({
+
+        fold_summary = {
             "fold": fold,
             "best_epoch": res["best_epoch"],
             "best_val_auc": res["best_auc"],
@@ -1391,7 +1884,68 @@ def train_kfold(pt, cfg, device, log_dir):
             "n_val_pos": int((pt_va["y"] == 1).sum()),
             "train_molecular": fold_records[fold]["train_molecular"],
             "val_molecular": fold_records[fold]["val_molecular"],
-        })
+            "val_metrics": res.get("val_metrics"),
+        }
+
+        if res.get("val_predictions") is not None and len(res["val_predictions"]):
+            pred_df = res["val_predictions"].copy()
+            pred_df["fold"] = fold
+            oof_frames.append(pred_df)
+
+        # 亚组专训 / 显式总体划分：在总体 fold 验证集上再评估一次
+        if overall_splits is not None and fold < len(overall_splits):
+            _, ov_va_idx = overall_splits[fold]
+            pt_ov = pt.iloc[ov_va_idx].reset_index(drop=True)
+            ckpt_path = res.get("ckpt_best") or resolve_ckpt_path(fold_dir)
+            if ckpt_path and len(pt_ov) > 0:
+                encoder = res.get("encoder")
+                if encoder is None:
+                    enc_path = os.path.join(fold_dir, "clinical_encoder.json")
+                    if os.path.isfile(enc_path):
+                        encoder = load_clinical_encoder(enc_path)
+                eval_model, eval_cfg = load_model_for_eval(
+                    cfg, device, ckpt_path, encoder=encoder
+                )
+                ov_pred = predict_patient_table(
+                    eval_model, pt_ov, eval_cfg, device, clinical_encoder=encoder
+                )
+                ov_pred["fold"] = fold
+                _, ov_metrics = save_prediction_outputs(
+                    fold_dir, ov_pred, prefix="val_overall",
+                    extra_meta={
+                        "ckpt_path": os.path.abspath(ckpt_path),
+                        "eval_splits_path": os.path.abspath(overall_splits_path),
+                        "split": "overall_fold_val",
+                    },
+                )
+                print_metrics_block(f"[fold{fold}] overall-val", ov_metrics)
+                fold_summary["overall_val_metrics"] = ov_metrics
+                overall_eval_frames.append(ov_pred)
+
+        fold_summaries.append(fold_summary)
+
+    # OOF：各折验证集预测拼接
+    oof_metrics = None
+    if oof_frames:
+        oof_df = pd.concat(oof_frames, ignore_index=True)
+        _, oof_metrics = save_prediction_outputs(
+            log_dir, oof_df, prefix="oof",
+            extra_meta={"split": "oof_val", "source_splits_path": splits_path},
+        )
+        print_metrics_block("[OOF]", oof_metrics)
+
+    overall_oof_metrics = None
+    if overall_eval_frames:
+        ov_df = pd.concat(overall_eval_frames, ignore_index=True)
+        _, overall_oof_metrics = save_prediction_outputs(
+            log_dir, ov_df, prefix="oof_overall",
+            extra_meta={
+                "split": "oof_overall_val",
+                "eval_splits_path": overall_splits_path,
+                "subgroup_training": subgroup_mode,
+            },
+        )
+        print_metrics_block("[OOF-overall]", overall_oof_metrics)
 
     valid = [v for v in val_aucs if v is not None and v == v]
     summary = {
@@ -1405,20 +1959,29 @@ def train_kfold(pt, cfg, device, log_dir):
         "splits_file": "kfold_splits.yaml",
         "source_splits_path": split_meta.get("source_splits_path"),
         "loaded_from_file": split_meta.get("loaded_from_file", False),
+        "subgroup_training": subgroup_mode,
+        "subgroup": split_meta.get("subgroup"),
+        "eval_overall_splits_path": overall_splits_path,
         "folds": fold_summaries,
         "best_epochs": best_epochs,
         "val_auc_per_fold": val_aucs,
         "mean_val_auc": float(np.mean(valid)) if valid else None,
         "std_val_auc": float(np.std(valid)) if valid else None,
+        "oof_metrics": oof_metrics,
+        "oof_overall_metrics": overall_oof_metrics,
         "label_map": {"N-pCR": 0, "pCR": 1},
     }
     save_yaml(summary, os.path.join(log_dir, "kfold_summary.yaml"))
     with open(os.path.join(log_dir, "kfold_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_to_builtin(summary), f, ensure_ascii=False, indent=2)
     print("\n===== K-fold 完成 =====")
-    print(f"stratify_by: {split_meta['stratify_by']}")
+    print(f"stratify_by: {split_meta.get('stratify_by')}")
     print(f"best_epochs: {best_epochs}")
     print(f"mean_val_auc: {summary['mean_val_auc']}")
+    if oof_metrics is not None:
+        print_metrics_block("最终 OOF", oof_metrics)
+    if overall_oof_metrics is not None:
+        print_metrics_block("最终 OOF-overall（亚组专训/总体评估）", overall_oof_metrics)
     return summary
 
 
@@ -1441,82 +2004,6 @@ def train_all(pt, cfg, device, log_dir):
     print("\n===== All-train 完成 =====")
     print(f"最低 train loss epoch: {res['best_epoch']}, loss={res['best_loss']:.4f}")
     return summary
-
-
-@torch.no_grad()
-def run_inference(cfg, device, args):
-    modality = normalize_modality(cfg)
-    df = read_csv_smart(args.csv_path)
-    pt, _, _ = build_patient_table(
-        df,
-        label_col=cfg.get("label_col", "label"),
-        feat_path_col=cfg.get("feat_path_col"),
-        require_feats=(modality != "clinical"),
-    )
-
-    ckpt_dir = os.path.dirname(os.path.abspath(args.ckpt_path))
-    encoder_path = os.path.join(ckpt_dir, "clinical_encoder.json")
-    encoder = None
-    if modality in ("pathomic", "clinical"):
-        if os.path.isfile(encoder_path):
-            encoder = load_clinical_encoder(encoder_path)
-            cfg["clinical_in_dim"] = encoder.output_dim
-        else:
-            if modality == "clinical":
-                raise FileNotFoundError(
-                    f"clinical_only 推理需要 {encoder_path}"
-                )
-            print(f"警告: 未找到 {encoder_path}，将不使用临床特征推理")
-            cfg["modality"] = "pathology"
-            cfg["use_clinical"] = False
-            cfg["clinical_only"] = False
-            cfg["clinical_in_dim"] = 0
-            modality = "pathology"
-
-    model = build_model(cfg, device)
-    state = torch.load(args.ckpt_path, map_location=device)
-    model.load_state_dict(state)
-    model.eval()
-
-    loader = make_loader(pt, cfg, training=False, clinical_encoder=encoder)
-    rows, ys, probs, preds = [], [], [], []
-    for feats, clinical, label, cid in loader:
-        if modality != "clinical":
-            feats = feats.to(device)
-        logits = model_forward(model, feats, clinical, cfg, device)
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-        prob1 = float(torch.softmax(logits, dim=-1)[0, 1].cpu().item())
-        pred = int(torch.argmax(logits, dim=-1).cpu().item())
-        rows.append({
-            "case_id": cid,
-            "label": int(label),
-            "prob_pCR": prob1,
-            "pred": pred,
-        })
-        ys.append(int(label))
-        probs.append(prob1)
-        preds.append(pred)
-
-    os.makedirs(args.save_infer_dir, exist_ok=True)
-    pred_df = pd.DataFrame(rows)
-    pred_csv = os.path.join(args.save_infer_dir, "predictions.csv")
-    pred_df.to_csv(pred_csv, index=False)
-
-    metrics = compute_cls_metrics(ys, probs, preds)
-    metrics.update({
-        "ckpt_path": os.path.abspath(args.ckpt_path),
-        "csv_path": os.path.abspath(args.csv_path),
-        "label_map": {"N-pCR": 0, "pCR": 1},
-    })
-    with open(os.path.join(args.save_infer_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
-    print(
-        f"推理完成：AUC={metrics['auc']:.4f} ACC={metrics['acc']:.4f} F1={metrics['f1']:.4f}，"
-        f"结果保存到 {args.save_infer_dir}"
-    )
-    print(f"  - 每患者预测: {pred_csv}")
-    return metrics
 
 
 # ============================================================================
@@ -1573,21 +2060,28 @@ def save_run_config(cfg, log_dir):
 
 
 def get_args():
-    p = argparse.ArgumentParser(description="乳腺 NAC pCR 二分类训练/推理脚本")
-    p.add_argument("--mode", choices=["train", "infer"], default="train")
+    p = argparse.ArgumentParser(description="乳腺 NAC pCR 二分类训练脚本")
 
-    # 数据 / 路径
-    p.add_argument("--csv_path", type=str, required=True, help="输入 CSV（见 example_dataset.csv）")
-    p.add_argument("--log_root", type=str, default="./logs", help="日志根目录（train）")
-    p.add_argument("--exp_name", type=str, default="exp", help="实验名（train）")
+    # 数据 / 路径（CSV 从预划分 meta.csv_path 读取）
+    p.add_argument("--log_root", type=str, default="./logs", help="日志根目录")
+    p.add_argument("--exp_name", type=str, default="exp", help="实验名")
     p.add_argument("--config", type=str, default=None,
-                   help="超参数配置文件（yaml/yml/json）：覆盖默认或提供推理所需模型超参")
+                   help="超参数配置文件（yaml/yml/json）：覆盖默认超参")
 
-    # 推理
-    p.add_argument("--ckpt_path", type=str, default=None, help="权重路径（infer）")
-    p.add_argument("--save_infer_dir", type=str, default=None, help="推理结果保存目录（infer）")
-
-    # 划分
+    # 划分（数据入口：必须依赖预划分）
+    p.add_argument(
+        "--splits_path",
+        type=str,
+        required=True,
+        help="预划分结果路径（必填）：kfold_splits.yaml/.json 或其父目录。"
+             "CSV 从该文件 meta.csv_path 读取。须先运行 make_kfold_splits.py 生成",
+    )
+    p.add_argument(
+        "--csv_path",
+        type=str,
+        default=None,
+        help="可选：覆盖预划分 meta.csv_path（仅当原 CSV 路径失效时使用）",
+    )
     p.add_argument("--split_mode", choices=["kfold", "all_train"], default="kfold")
     p.add_argument(
         "--k", type=int, default=5,
@@ -1602,11 +2096,11 @@ def get_args():
              "实际划分请使用 make_kfold_splits.py --stratify_by",
     )
     p.add_argument(
-        "--splits_path",
+        "--eval_overall_splits",
         type=str,
         default=None,
-        help="预划分结果路径（kfold 训练必填）：kfold_splits.yaml/.json 或其父目录。"
-             "须先运行 make_kfold_splits.py 生成",
+        help="亚组专训时用于总体验证评估的划分（kfold_splits.yaml 或目录）。"
+             "默认若 --splits_path 位于 molecular_subgroups/<Molecular>/ 下则自动上溯父级总体划分",
     )
 
     # 标签 / 特征路径列
@@ -1623,6 +2117,35 @@ def get_args():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--opt", choices=["adam", "sgd"], default="adam")
     p.add_argument("--num_workers", type=int, default=2)
+
+    # 早停（有验证集时生效；all_train 无 val 时自动跳过）
+    p.add_argument(
+        "--early_stop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否启用早停（默认开启；--no-early_stop 关闭）",
+    )
+    p.add_argument(
+        "--patience",
+        type=int,
+        default=10,
+        help="早停耐心：监控指标连续多少个 epoch 无提升则停止（默认 10）",
+    )
+    p.add_argument(
+        "--min_delta",
+        type=float,
+        default=0.0,
+        help="判定为提升的最小变化量（默认 0；val_auc 等越大越好，val_loss 越小越好）",
+    )
+    p.add_argument(
+        "--early_stop_metric",
+        type=str,
+        default="val_auc",
+        choices=list(EARLY_STOP_METRIC_CHOICES),
+        help="早停监控指标（默认 val_auc）："
+             "val_auc/val_auprc/val_loss/val_acc/val_balanced_acc/"
+             "val_f1/val_precision/val_recall/val_sensitivity/val_specificity/val_mcc",
+    )
 
     # 模型
     p.add_argument("--model_type",
@@ -1681,23 +2204,18 @@ def main():
             cfg["modality"] = "pathology"
     modality = normalize_modality(cfg)
 
-    if args.mode == "infer":
-        assert args.ckpt_path and args.save_infer_dir, "推理需要 --ckpt_path 与 --save_infer_dir"
-        assert args.config, "推理需要 --config 指定训练时保存的超参数 yaml/json"
-        if modality != "clinical":
-            if cfg.get("in_dim", -1) is None or cfg.get("in_dim", -1) <= 0:
-                df = read_csv_smart(args.csv_path)
-                feat_col = resolve_feat_path_col(df, cfg.get("feat_path_col"))
-                cfg["in_dim"] = detect_in_dim(df[feat_col].astype(str).tolist(), cfg["feat_key"])
-        else:
-            cfg["in_dim"] = 0
-        set_seed(cfg["seed"])
-        run_inference(cfg, device, args)
-        return
-
-    # ---- 训练 ----
+    # 必须依赖预划分；CSV 从 meta.csv_path 读取
     set_seed(cfg["seed"])
-    df = read_csv_smart(args.csv_path)
+    splits_path = resolve_runtime_splits_path(args, cfg)
+    csv_path = resolve_csv_path_from_splits(
+        splits_path, csv_override=getattr(args, "csv_path", None)
+    )
+    cfg["splits_path"] = splits_path
+    cfg["csv_path"] = csv_path
+    print(f"数据来自预划分: splits={splits_path}")
+    print(f"CSV: {csv_path}")
+
+    df = read_csv_smart(csv_path)
     pt, clinical_cols, feat_col = build_patient_table(
         df,
         label_col=cfg.get("label_col", "label"),
@@ -1706,11 +2224,6 @@ def main():
     )
     cfg["feat_path_col"] = feat_col
     cfg["n_classes"] = 2
-
-    if cfg["split_mode"] == "kfold":
-        cfg["splits_path"] = resolve_splits_path(cfg.get("splits_path"), required=True)
-    else:
-        cfg["splits_path"] = resolve_splits_path(cfg.get("splits_path"), required=False)
 
     if modality == "clinical":
         cfg["in_dim"] = 0
@@ -1731,8 +2244,12 @@ def main():
     save_run_config(cfg, log_dir)
 
     if cfg["split_mode"] == "kfold":
-        train_kfold(pt, cfg, device, log_dir)
+        train_kfold(
+            pt, cfg, device, log_dir,
+            eval_overall_splits=getattr(args, "eval_overall_splits", None),
+        )
     else:
+        # all_train 仍要求预划分（用于定位 CSV），但不按折训练
         train_all(pt, cfg, device, log_dir)
 
 
