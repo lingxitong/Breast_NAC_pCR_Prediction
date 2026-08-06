@@ -194,7 +194,7 @@ def ensemble_predictions(fold_pred_map):
     return ens
 
 
-def try_oof_predictions(log_dir, pt, fold_pred_map, save_dir):
+def try_oof_predictions(log_dir, pt, fold_pred_map, save_dir, cfg=None):
     """若日志内有划分文件且 case 可对齐，生成 OOF 预测与指标。"""
     splits_file = None
     for name in ("kfold_splits.yaml", "kfold_splits.yml", "kfold_splits.json"):
@@ -235,6 +235,7 @@ def try_oof_predictions(log_dir, pt, fold_pred_map, save_dir):
             "split_type": split_meta.get("split_type"),
             "label_map": {"N-pCR": 0, "pCR": 1},
         },
+        cfg=cfg,
     )
     oof_df.to_csv(os.path.join(save_dir, "predictions_oof.csv"), index=False)
     T.print_metrics_block("[OOF]", oof_metrics)
@@ -254,6 +255,10 @@ def run_infer(args):
         raise FileNotFoundError(f"CSV 不存在: {csv_path}")
 
     cfg = load_train_config(log_dir, config_override=args.config)
+    if getattr(args, "n_boot", None) is not None:
+        cfg["n_boot"] = int(args.n_boot)
+    if getattr(args, "bootstrap_ci", None) is not None:
+        cfg["bootstrap_ci"] = float(args.bootstrap_ci)
     T.set_seed(int(cfg.get("seed", 1)))
     modality = T.normalize_modality(cfg)
     pt = prepare_patient_table(cfg, csv_path)
@@ -293,6 +298,7 @@ def run_infer(args):
                 "fold": fold_idx if fold_idx >= 0 else None,
                 "label_map": {"N-pCR": 0, "pCR": 1},
             },
+            cfg=cfg,
         )
         pred_df.to_csv(os.path.join(fold_out, "predictions.csv"), index=False)
         T.print_metrics_block(f"[{tag}]", fold_metrics)
@@ -304,6 +310,7 @@ def run_infer(args):
         })
 
     ens_metrics = None
+    mean_fold_metrics = None
     if mode == "kfold" and len(fold_pred_map) > 1:
         ens = ensemble_predictions(fold_pred_map)
         _, ens_metrics = T.save_prediction_outputs(
@@ -315,9 +322,21 @@ def run_infer(args):
                 "mode": "ensemble_mean",
                 "label_map": {"N-pCR": 0, "pCR": 1},
             },
+            cfg=cfg,
         )
         ens.to_csv(os.path.join(save_dir, "predictions_ensemble.csv"), index=False)
         T.print_metrics_block("[Ensemble]", ens_metrics)
+
+        # 各折指标的折级 bootstrap 平均
+        n_boot, boot_seed, boot_ci = T.resolve_bootstrap_params(cfg=cfg)
+        mean_fold_metrics = T.aggregate_fold_metrics_bootstrap(
+            [r["metrics"] for r in fold_records],
+            n_boot=n_boot, seed=boot_seed, ci=boot_ci,
+        )
+        with open(os.path.join(save_dir, "mean_fold_metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(T._to_builtin(mean_fold_metrics), f, ensure_ascii=False, indent=2)
+        T.save_yaml(mean_fold_metrics, os.path.join(save_dir, "mean_fold_metrics.yaml"))
+        T.print_metrics_block("[K折平均(折级bootstrap)]", mean_fold_metrics)
     elif len(fold_pred_map) == 1:
         # 单模型：根目录再落一份简名结果
         only = next(iter(fold_pred_map.values()))
@@ -326,7 +345,7 @@ def run_infer(args):
 
     oof_metrics = None
     if mode == "kfold":
-        oof_metrics = try_oof_predictions(log_dir, pt, fold_pred_map, save_dir)
+        oof_metrics = try_oof_predictions(log_dir, pt, fold_pred_map, save_dir, cfg=cfg)
 
     summary = {
         "log_dir": log_dir,
@@ -338,7 +357,10 @@ def run_infer(args):
         "n_models": len(ckpt_items),
         "n_patients": int(len(pt)),
         "ensemble_metrics": ens_metrics,
+        "mean_fold_metrics": mean_fold_metrics,
         "oof_metrics": oof_metrics,
+        "n_boot": cfg.get("n_boot"),
+        "bootstrap_ci": cfg.get("bootstrap_ci"),
         "folds": [
             {
                 "fold": r["fold"],
@@ -384,6 +406,14 @@ def get_args():
     p.add_argument(
         "--ckpt_name", type=str, default="checkpoint_best.pt",
         help="各 fold 优先使用的权重文件名（不存在则回退 last/best_loss）",
+    )
+    p.add_argument(
+        "--n_boot", type=int, default=None,
+        help="bootstrap 次数（默认读取训练 config 的 n_boot，否则 1000；<=0 关闭）",
+    )
+    p.add_argument(
+        "--bootstrap_ci", type=float, default=None,
+        help="bootstrap 置信水平（默认读取训练 config，否则 0.95）",
     )
     return p.parse_args()
 

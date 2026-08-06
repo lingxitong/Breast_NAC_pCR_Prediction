@@ -10,6 +10,8 @@ main_pcr.py
   * 损失：CrossEntropy
   * 评价：AUC / AUPRC / Accuracy / Balanced Acc / F1 / Precision / Recall
     （Sensitivity）/ Specificity / PPV / NPV / MCC，以及 TP/TN/FP/FN
+  * 终末评估（单折/OOF/ensemble 等）对样本做 bootstrap×1000 给出 95% CI；
+    K 折平均时对各折指标再做 bootstrap×1000 给出均值的 95% CI
   * 一个患者(case)可能有多张 slide，训练时拼接成一个 bag；若 slide 数 > max_slides
     则随机选取 max_slides 张拼接；验证时拼接全部 slide。
 
@@ -166,11 +168,21 @@ HPARAM_KEYS = [
     "drop_out", "gc", "seed", "opt", "model_type", "in_dim",
     "hidden_dim", "max_slides_train", "feat_key", "num_workers",
     "early_stop", "patience", "min_delta", "early_stop_metric",
+    "n_boot", "bootstrap_ci",
     "mambamil_layer", "mambamil_rate", "mambamil_type",
     "modality", "clinical_only", "use_clinical",
     "fusion_type", "clinical_hidden_dim", "clinical_in_dim",
     "label_col", "feat_path_col",
 ]
+
+# 需要报告 bootstrap 95% CI 的性能指标（不含混淆矩阵计数）
+BOOTSTRAP_METRIC_KEYS = (
+    "auc", "auprc", "acc", "balanced_acc",
+    "f1", "precision", "recall", "sensitivity", "specificity",
+    "ppv", "npv", "mcc",
+)
+DEFAULT_N_BOOT = 1000
+DEFAULT_BOOTSTRAP_CI = 0.95
 
 # 早停监控指标
 EARLY_STOP_METRIC_CHOICES = (
@@ -964,6 +976,191 @@ def compute_cls_metrics(y_true, y_prob, y_pred=None, thr=0.5):
     return metrics
 
 
+def _percentile_ci(values, ci=DEFAULT_BOOTSTRAP_CI):
+    """对一组 bootstrap 统计量取百分位 CI；无有效值时返回 nan。"""
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    alpha = 1.0 - float(ci)
+    low = float(np.percentile(arr, 100.0 * alpha / 2.0))
+    high = float(np.percentile(arr, 100.0 * (1.0 - alpha / 2.0)))
+    return low, high
+
+
+def _attach_ci_fields(metrics, boot_store, n_boot, seed, level, ci=DEFAULT_BOOTSTRAP_CI):
+    """将 bootstrap 百分位 CI 写入指标字典（{key}_ci95_low / {key}_ci95_high）。"""
+    out = dict(metrics)
+    for key in BOOTSTRAP_METRIC_KEYS:
+        low, high = _percentile_ci(boot_store.get(key, []), ci=ci)
+        out[f"{key}_ci95_low"] = low
+        out[f"{key}_ci95_high"] = high
+    out["bootstrap_n"] = int(n_boot)
+    out["bootstrap_seed"] = int(seed)
+    out["bootstrap_level"] = str(level)
+    out["bootstrap_ci"] = float(ci)
+    return out
+
+
+def compute_cls_metrics_bootstrap(
+    y_true, y_prob, y_pred=None, thr=0.5,
+    n_boot=DEFAULT_N_BOOT, seed=1, ci=DEFAULT_BOOTSTRAP_CI,
+):
+    """
+    点估计 + 样本级 bootstrap 95% CI。
+    对 n 个样本有放回重采样 n_boot 次，对 BOOTSTRAP_METRIC_KEYS 取百分位区间。
+    n_boot<=0 或样本不足时仅返回点估计。
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+    if y_pred is None:
+        y_pred = (y_prob >= float(thr)).astype(int)
+    else:
+        y_pred = np.asarray(y_pred).astype(int)
+
+    point = compute_cls_metrics(y_true, y_prob, y_pred, thr=thr)
+    n_boot = int(n_boot)
+    if n_boot <= 0 or point["n"] < 1:
+        return point
+
+    n = int(point["n"])
+    rng = np.random.RandomState(int(seed))
+    boot_store = {k: [] for k in BOOTSTRAP_METRIC_KEYS}
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, size=n)
+        m = compute_cls_metrics(y_true[idx], y_prob[idx], y_pred[idx], thr=thr)
+        for k in BOOTSTRAP_METRIC_KEYS:
+            v = m.get(k, float("nan"))
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            if v == v:  # not NaN
+                boot_store[k].append(v)
+    return _attach_ci_fields(point, boot_store, n_boot, seed, level="sample", ci=ci)
+
+
+def _mean_ignore_nan(values):
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    return float(np.mean(arr))
+
+
+def aggregate_fold_metrics_bootstrap(
+    fold_bundles,
+    n_boot=DEFAULT_N_BOOT,
+    seed=1,
+    ci=DEFAULT_BOOTSTRAP_CI,
+    molecular_cats=None,
+):
+    """
+    对 K 折指标做算术平均，并对折索引做 bootstrap×n_boot 给出均值的 95% CI。
+    fold_bundles: list[{"overall": dict, "by_molecular": dict}, ...]
+    """
+    bundles = [b for b in (fold_bundles or []) if isinstance(b, dict) and b.get("overall")]
+    empty = compute_cls_metrics([], [], [])
+    cats = list(molecular_cats or MOLECULAR_CATEGORIES)
+    if not bundles:
+        return {
+            "overall": empty,
+            "by_molecular": {c: dict(empty) for c in cats},
+            "n_folds": 0,
+            "bootstrap_level": "fold",
+        }
+
+    # 收集 overall 各折点估计
+    overall_list = [b["overall"] for b in bundles]
+    n_folds = len(overall_list)
+
+    def _aggregate_metric_dicts(dicts, level_seed):
+        """对一组同构指标字典求均值 + 折级 bootstrap CI。"""
+        if not dicts:
+            return dict(empty)
+        # 点估计：各折算术平均（计数类也平均，便于报告）
+        keys = set()
+        for d in dicts:
+            keys.update(d.keys())
+        # 排除已有 CI / bootstrap 元数据，避免把 CI 再平均
+        skip_suffix = ("_ci95_low", "_ci95_high")
+        skip_exact = {
+            "bootstrap_n", "bootstrap_seed", "bootstrap_level", "bootstrap_ci",
+        }
+        mean_metrics = {}
+        for k in sorted(keys):
+            if k in skip_exact or k.endswith(skip_suffix):
+                continue
+            vals = []
+            for d in dicts:
+                if k not in d:
+                    continue
+                try:
+                    vals.append(float(d[k]))
+                except (TypeError, ValueError):
+                    continue
+            mean_metrics[k] = _mean_ignore_nan(vals)
+
+        n_boot_i = int(n_boot)
+        if n_boot_i <= 0 or len(dicts) < 1:
+            mean_metrics["n_folds"] = int(len(dicts))
+            return mean_metrics
+
+        rng = np.random.RandomState(int(level_seed))
+        boot_store = {k: [] for k in BOOTSTRAP_METRIC_KEYS}
+        n = len(dicts)
+        for _ in range(n_boot_i):
+            idx = rng.randint(0, n, size=n)
+            for k in BOOTSTRAP_METRIC_KEYS:
+                vals = []
+                for i in idx:
+                    v = dicts[i].get(k, float("nan"))
+                    try:
+                        v = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if v == v:
+                        vals.append(v)
+                if vals:
+                    boot_store[k].append(float(np.mean(vals)))
+        out = _attach_ci_fields(
+            mean_metrics, boot_store, n_boot_i, level_seed, level="fold", ci=ci
+        )
+        out["n_folds"] = int(n)
+        return out
+
+    overall = _aggregate_metric_dicts(overall_list, seed)
+
+    # 亚组：仅对 n>0 的折参与平均与 bootstrap
+    all_cats = list(cats)
+    for b in bundles:
+        for c in (b.get("by_molecular") or {}):
+            if c not in all_cats:
+                all_cats.append(c)
+
+    by_mol = {}
+    for j, cat in enumerate(all_cats):
+        cat_dicts = []
+        for b in bundles:
+            m = (b.get("by_molecular") or {}).get(cat)
+            if m is None:
+                continue
+            if int(m.get("n", 0) or 0) <= 0:
+                continue
+            cat_dicts.append(m)
+        by_mol[cat] = _aggregate_metric_dicts(cat_dicts, int(seed) + 1 + j)
+
+    return {
+        "overall": overall,
+        "by_molecular": by_mol,
+        "n_folds": n_folds,
+        "bootstrap_level": "fold",
+        "bootstrap_n": int(n_boot),
+        "bootstrap_seed": int(seed),
+        "bootstrap_ci": float(ci),
+    }
+
+
 def prefix_epoch_metrics(metrics, prefix):
     """将 run_epoch 指标扁平化为 train_*/val_* 列，用于 metrics.csv。"""
     out = {}
@@ -1004,17 +1201,40 @@ def normalize_molecular_value(raw):
     return s
 
 
-def compute_metrics_with_subgroups(pred_df, thr=0.5, molecular_cats=None):
+def resolve_bootstrap_params(cfg=None, n_boot=None, bootstrap_seed=None, ci=None):
+    """从 cfg / 显式参数解析 bootstrap 设置。"""
+    cfg = cfg or {}
+    if n_boot is None:
+        n_boot = cfg.get("n_boot", DEFAULT_N_BOOT)
+    if bootstrap_seed is None:
+        bootstrap_seed = cfg.get("seed", 1)
+    if ci is None:
+        ci = cfg.get("bootstrap_ci", DEFAULT_BOOTSTRAP_CI)
+    return int(n_boot), int(bootstrap_seed), float(ci)
+
+
+def compute_metrics_with_subgroups(
+    pred_df, thr=0.5, molecular_cats=None,
+    n_boot=DEFAULT_N_BOOT, bootstrap_seed=1, ci=DEFAULT_BOOTSTRAP_CI,
+):
     """
-    基于预测表计算总体指标 + 各 Molecular 亚组指标。
+    基于预测表计算总体指标 + 各 Molecular 亚组指标（含样本级 bootstrap 95% CI）。
     pred_df 需含列: label, prob_pCR；可选 Molecular / pred。
     """
+    metric_fn = (
+        (lambda yt, yp, yhat, t: compute_cls_metrics_bootstrap(
+            yt, yp, yhat, thr=t, n_boot=n_boot, seed=bootstrap_seed, ci=ci
+        ))
+        if int(n_boot) > 0 else
+        (lambda yt, yp, yhat, t: compute_cls_metrics(yt, yp, yhat, thr=t))
+    )
+
     if pred_df is None or len(pred_df) == 0:
-        empty = compute_cls_metrics([], [], [])
+        empty = metric_fn([], [], None, thr)
         cats = list(molecular_cats or MOLECULAR_CATEGORIES)
         return {
             "overall": empty,
-            "by_molecular": {c: compute_cls_metrics([], [], []) for c in cats},
+            "by_molecular": {c: metric_fn([], [], None, thr) for c in cats},
         }
 
     df = pred_df.copy()
@@ -1025,21 +1245,37 @@ def compute_metrics_with_subgroups(pred_df, thr=0.5, molecular_cats=None):
     else:
         df["Molecular"] = "missing"
 
-    overall = compute_cls_metrics(df["label"], df["prob_pCR"], df["pred"], thr=thr)
+    overall = metric_fn(df["label"], df["prob_pCR"], df["pred"], thr)
     cats = list(molecular_cats or MOLECULAR_CATEGORIES)
     # 保证四类都有条目；额外出现的类别也一并报告
     extra = [c for c in sorted(df["Molecular"].unique()) if c not in cats]
     by_mol = {}
-    for cat in cats + extra:
+    for j, cat in enumerate(cats + extra):
         sub = df[df["Molecular"] == cat]
-        by_mol[cat] = compute_cls_metrics(
-            sub["label"], sub["prob_pCR"], sub["pred"] if len(sub) else None, thr=thr
-        )
+        # 亚组使用偏移 seed，避免与 overall 完全共用同一重采样序列
+        if int(n_boot) > 0:
+            by_mol[cat] = compute_cls_metrics_bootstrap(
+                sub["label"], sub["prob_pCR"],
+                sub["pred"] if len(sub) else None,
+                thr=thr, n_boot=n_boot,
+                seed=int(bootstrap_seed) + 1 + j, ci=ci,
+            )
+        else:
+            by_mol[cat] = compute_cls_metrics(
+                sub["label"], sub["prob_pCR"],
+                sub["pred"] if len(sub) else None, thr=thr,
+            )
     return {"overall": overall, "by_molecular": by_mol}
 
 
-def save_prediction_outputs(out_dir, pred_df, prefix="val", extra_meta=None):
-    """保存逐样本预测 CSV + 总体/亚组指标 JSON/YAML。"""
+def save_prediction_outputs(
+    out_dir, pred_df, prefix="val", extra_meta=None,
+    n_boot=None, bootstrap_seed=None, ci=None, cfg=None,
+):
+    """保存逐样本预测 CSV + 总体/亚组指标 JSON/YAML（含样本级 bootstrap CI）。"""
+    n_boot, bootstrap_seed, ci = resolve_bootstrap_params(
+        cfg=cfg, n_boot=n_boot, bootstrap_seed=bootstrap_seed, ci=ci
+    )
     os.makedirs(out_dir, exist_ok=True)
     pred_path = os.path.join(out_dir, f"{prefix}_predictions.csv")
     metrics_json = os.path.join(out_dir, f"{prefix}_metrics.json")
@@ -1050,7 +1286,9 @@ def save_prediction_outputs(out_dir, pred_df, prefix="val", extra_meta=None):
             columns=["case_id", "label", "Molecular", "prob_pCR", "pred"]
         )
         empty_df.to_csv(pred_path, index=False)
-        metrics = compute_metrics_with_subgroups(empty_df)
+        metrics = compute_metrics_with_subgroups(
+            empty_df, n_boot=n_boot, bootstrap_seed=bootstrap_seed, ci=ci
+        )
     else:
         out_df = pred_df.copy()
         if "Molecular" in out_df.columns:
@@ -1058,7 +1296,9 @@ def save_prediction_outputs(out_dir, pred_df, prefix="val", extra_meta=None):
         cols = [c for c in ["case_id", "label", "Molecular", "prob_pCR", "pred", "fold"]
                 if c in out_df.columns]
         out_df[cols].to_csv(pred_path, index=False)
-        metrics = compute_metrics_with_subgroups(out_df)
+        metrics = compute_metrics_with_subgroups(
+            out_df, n_boot=n_boot, bootstrap_seed=bootstrap_seed, ci=ci
+        )
 
     if extra_meta:
         metrics = dict(metrics)
@@ -1081,21 +1321,35 @@ def _fmt_metric(m, key, nd=4):
     return f"{v:.{nd}f}"
 
 
+def _fmt_metric_ci(m, key, nd=4):
+    """格式化为 value [low, high]；无 CI 时仅 value。"""
+    base = _fmt_metric(m, key, nd=nd)
+    low = m.get(f"{key}_ci95_low", float("nan"))
+    high = m.get(f"{key}_ci95_high", float("nan"))
+    try:
+        low_f, high_f = float(low), float(high)
+    except (TypeError, ValueError):
+        return base
+    if low_f != low_f or high_f != high_f:
+        return base
+    return f"{base} [{low_f:.{nd}f}, {high_f:.{nd}f}]"
+
+
 def print_metrics_block(title, metrics_bundle):
-    """打印总体 + 亚组指标摘要。"""
+    """打印总体 + 亚组指标摘要（含 95% CI，若有）。"""
     overall = metrics_bundle.get("overall", {})
     print(
         f"{title} overall: n={overall.get('n', 0)}, "
-        f"AUC={_fmt_metric(overall, 'auc')}, AUPRC={_fmt_metric(overall, 'auprc')}, "
-        f"ACC={_fmt_metric(overall, 'acc')}, bACC={_fmt_metric(overall, 'balanced_acc')}, "
-        f"F1={_fmt_metric(overall, 'f1')}, "
-        f"P={_fmt_metric(overall, 'precision')}, R={_fmt_metric(overall, 'recall')}, "
-        f"Spec={_fmt_metric(overall, 'specificity')}, MCC={_fmt_metric(overall, 'mcc')}"
+        f"AUC={_fmt_metric_ci(overall, 'auc')}, AUPRC={_fmt_metric_ci(overall, 'auprc')}, "
+        f"ACC={_fmt_metric_ci(overall, 'acc')}, bACC={_fmt_metric_ci(overall, 'balanced_acc')}, "
+        f"F1={_fmt_metric_ci(overall, 'f1')}, "
+        f"P={_fmt_metric_ci(overall, 'precision')}, R={_fmt_metric_ci(overall, 'recall')}, "
+        f"Spec={_fmt_metric_ci(overall, 'specificity')}, MCC={_fmt_metric_ci(overall, 'mcc')}"
     )
     print(
         f"  confusion: TP={overall.get('tp', 0)} TN={overall.get('tn', 0)} "
         f"FP={overall.get('fp', 0)} FN={overall.get('fn', 0)} "
-        f"PPV={_fmt_metric(overall, 'ppv')} NPV={_fmt_metric(overall, 'npv')}"
+        f"PPV={_fmt_metric_ci(overall, 'ppv')} NPV={_fmt_metric_ci(overall, 'npv')}"
     )
     by_mol = metrics_bundle.get("by_molecular", {})
     for cat in MOLECULAR_CATEGORIES:
@@ -1103,11 +1357,11 @@ def print_metrics_block(title, metrics_bundle):
         if not m or int(m.get("n", 0) or 0) == 0:
             continue
         print(
-            f"  [{cat}] n={m['n']} AUC={_fmt_metric(m, 'auc')} "
-            f"AUPRC={_fmt_metric(m, 'auprc')} ACC={_fmt_metric(m, 'acc')} "
-            f"F1={_fmt_metric(m, 'f1')} P={_fmt_metric(m, 'precision')} "
-            f"R={_fmt_metric(m, 'recall')} Spec={_fmt_metric(m, 'specificity')} "
-            f"MCC={_fmt_metric(m, 'mcc')}"
+            f"  [{cat}] n={m['n']} AUC={_fmt_metric_ci(m, 'auc')} "
+            f"AUPRC={_fmt_metric_ci(m, 'auprc')} ACC={_fmt_metric_ci(m, 'acc')} "
+            f"F1={_fmt_metric_ci(m, 'f1')} P={_fmt_metric_ci(m, 'precision')} "
+            f"R={_fmt_metric_ci(m, 'recall')} Spec={_fmt_metric_ci(m, 'specificity')} "
+            f"MCC={_fmt_metric_ci(m, 'mcc')}"
         )
 
 
@@ -1419,6 +1673,7 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
                 "split": "fold_val",
                 "early_stop": early_stop_info,
             },
+            cfg=cfg,
         )
         print_metrics_block(f"[{fold_tag}] val", val_metrics)
 
@@ -1917,6 +2172,7 @@ def train_kfold(pt, cfg, device, log_dir, eval_overall_splits=None):
                         "eval_splits_path": os.path.abspath(overall_splits_path),
                         "split": "overall_fold_val",
                     },
+                    cfg=cfg,
                 )
                 print_metrics_block(f"[fold{fold}] overall-val", ov_metrics)
                 fold_summary["overall_val_metrics"] = ov_metrics
@@ -1924,13 +2180,16 @@ def train_kfold(pt, cfg, device, log_dir, eval_overall_splits=None):
 
         fold_summaries.append(fold_summary)
 
-    # OOF：各折验证集预测拼接
+    n_boot, boot_seed, boot_ci = resolve_bootstrap_params(cfg=cfg)
+
+    # OOF：各折验证集预测拼接（样本级 bootstrap CI）
     oof_metrics = None
     if oof_frames:
         oof_df = pd.concat(oof_frames, ignore_index=True)
         _, oof_metrics = save_prediction_outputs(
             log_dir, oof_df, prefix="oof",
             extra_meta={"split": "oof_val", "source_splits_path": splits_path},
+            cfg=cfg,
         )
         print_metrics_block("[OOF]", oof_metrics)
 
@@ -1944,10 +2203,42 @@ def train_kfold(pt, cfg, device, log_dir, eval_overall_splits=None):
                 "eval_splits_path": overall_splits_path,
                 "subgroup_training": subgroup_mode,
             },
+            cfg=cfg,
         )
         print_metrics_block("[OOF-overall]", overall_oof_metrics)
 
+    # K 折平均：对各折验证指标做折级 bootstrap，给出均值 95% CI
+    fold_val_bundles = [
+        fs["val_metrics"] for fs in fold_summaries
+        if isinstance(fs.get("val_metrics"), dict) and fs["val_metrics"].get("overall")
+    ]
+    mean_val_metrics = aggregate_fold_metrics_bootstrap(
+        fold_val_bundles, n_boot=n_boot, seed=boot_seed, ci=boot_ci,
+    )
+    # 落盘折级平均指标
+    with open(os.path.join(log_dir, "mean_val_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(_to_builtin(mean_val_metrics), f, ensure_ascii=False, indent=2)
+    save_yaml(mean_val_metrics, os.path.join(log_dir, "mean_val_metrics.yaml"))
+
+    mean_overall_val_metrics = None
+    fold_ov_bundles = [
+        fs["overall_val_metrics"] for fs in fold_summaries
+        if isinstance(fs.get("overall_val_metrics"), dict)
+        and fs["overall_val_metrics"].get("overall")
+    ]
+    if fold_ov_bundles:
+        mean_overall_val_metrics = aggregate_fold_metrics_bootstrap(
+            fold_ov_bundles, n_boot=n_boot, seed=boot_seed, ci=boot_ci,
+        )
+        with open(os.path.join(log_dir, "mean_overall_val_metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(_to_builtin(mean_overall_val_metrics), f, ensure_ascii=False, indent=2)
+        save_yaml(
+            mean_overall_val_metrics,
+            os.path.join(log_dir, "mean_overall_val_metrics.yaml"),
+        )
+
     valid = [v for v in val_aucs if v is not None and v == v]
+    mean_auc = mean_val_metrics.get("overall", {}).get("auc")
     summary = {
         "split_mode": "kfold",
         "k": cfg["k"],
@@ -1965,10 +2256,18 @@ def train_kfold(pt, cfg, device, log_dir, eval_overall_splits=None):
         "folds": fold_summaries,
         "best_epochs": best_epochs,
         "val_auc_per_fold": val_aucs,
-        "mean_val_auc": float(np.mean(valid)) if valid else None,
+        "mean_val_auc": float(mean_auc) if mean_auc == mean_auc else (
+            float(np.mean(valid)) if valid else None
+        ),
         "std_val_auc": float(np.std(valid)) if valid else None,
+        "mean_val_auc_ci95_low": mean_val_metrics.get("overall", {}).get("auc_ci95_low"),
+        "mean_val_auc_ci95_high": mean_val_metrics.get("overall", {}).get("auc_ci95_high"),
+        "mean_val_metrics": mean_val_metrics,
+        "mean_overall_val_metrics": mean_overall_val_metrics,
         "oof_metrics": oof_metrics,
         "oof_overall_metrics": overall_oof_metrics,
+        "n_boot": n_boot,
+        "bootstrap_ci": boot_ci,
         "label_map": {"N-pCR": 0, "pCR": 1},
     }
     save_yaml(summary, os.path.join(log_dir, "kfold_summary.yaml"))
@@ -1977,11 +2276,20 @@ def train_kfold(pt, cfg, device, log_dir, eval_overall_splits=None):
     print("\n===== K-fold 完成 =====")
     print(f"stratify_by: {split_meta.get('stratify_by')}")
     print(f"best_epochs: {best_epochs}")
-    print(f"mean_val_auc: {summary['mean_val_auc']}")
+    print(
+        f"mean_val_auc: {_fmt_metric_ci(mean_val_metrics.get('overall', {}), 'auc')} "
+        f"(std={summary['std_val_auc']})"
+    )
+    print_metrics_block("K折平均(折级bootstrap)", mean_val_metrics)
+    if mean_overall_val_metrics is not None:
+        print_metrics_block("K折平均-overall(折级bootstrap)", mean_overall_val_metrics)
     if oof_metrics is not None:
-        print_metrics_block("最终 OOF", oof_metrics)
+        print_metrics_block("最终 OOF(样本级bootstrap)", oof_metrics)
     if overall_oof_metrics is not None:
-        print_metrics_block("最终 OOF-overall（亚组专训/总体评估）", overall_oof_metrics)
+        print_metrics_block(
+            "最终 OOF-overall（亚组专训/总体评估, 样本级bootstrap）",
+            overall_oof_metrics,
+        )
     return summary
 
 
@@ -2115,6 +2423,14 @@ def get_args():
     p.add_argument("--drop_out", type=float, default=0.25)
     p.add_argument("--gc", type=int, default=16, help="梯度累积步数")
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument(
+        "--n_boot", type=int, default=DEFAULT_N_BOOT,
+        help="终末评估 bootstrap 次数（样本级 / K折级），默认 1000；<=0 关闭",
+    )
+    p.add_argument(
+        "--bootstrap_ci", type=float, default=DEFAULT_BOOTSTRAP_CI,
+        help="bootstrap 置信水平，默认 0.95",
+    )
     p.add_argument("--opt", choices=["adam", "sgd"], default="adam")
     p.add_argument("--num_workers", type=int, default=2)
 

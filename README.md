@@ -17,6 +17,7 @@
 - **临床编码**：因子 `Molecular,T,N,HER2` one-hot；连续 `Age,ER,PR,Ki67` 标准化  
   Molecular 四种：`HR+HER2-` / `HR+HER2+` / `TNBC` / `HER2`
 - **指标**：AUC / AUPRC / Acc / Balanced Acc / F1 / Precision / Recall（Sensitivity）/ Specificity / PPV / NPV / MCC / TP·TN·FP·FN
+- **Bootstrap 95% CI**：终末评估默认 `--n_boot 1000`；单折/OOF/ensemble 对**样本**有放回重采样；K 折平均对**折**有放回重采样（结果写入 `*_ci95_low` / `*_ci95_high`）
 - **早停**：有验证集时默认开启（`--patience` / `--early_stop_metric`）
 
 ```bash
@@ -179,6 +180,8 @@ slide bag → MIL → 全局表征 ─┐
 | `--gc` | `16` | 梯度累积 |
 | `--max_slides_train` | `3` | 训练时最多拼接 slide 数 |
 | `--in_dim` | 自动推断 | 特征维度；`<=0` 时从 `.pt` 读取 |
+| `--n_boot` | `1000` | bootstrap 次数（`<=0` 关闭 CI） |
+| `--bootstrap_ci` | `0.95` | 置信水平 |
 
 ### 训练日志结构
 
@@ -186,9 +189,10 @@ slide bag → MIL → 全局表征 ─┐
 logs/exp_name/
   config.yaml / config.json
   kfold_splits.yaml           # 本实验使用的划分副本
-  kfold_summary.yaml
+  kfold_summary.yaml          # 含 mean_val_metrics（折级 bootstrap CI）
+  mean_val_metrics.yaml       # K 折指标均值 ± 95% CI
   oof_predictions.csv         # 各折验证集拼接
-  oof_metrics.json
+  oof_metrics.json            # OOF 点估计 + 样本级 95% CI
   fold_0/
     split.yaml
     checkpoint_best.pt
@@ -197,7 +201,7 @@ logs/exp_name/
     metrics.csv               # 含完整 train_/val_ 指标列
     early_stop.json
     val_predictions.csv
-    val_metrics.json
+    val_metrics.json          # 含样本级 bootstrap 95% CI
   fold_1/ ...
 ```
 
