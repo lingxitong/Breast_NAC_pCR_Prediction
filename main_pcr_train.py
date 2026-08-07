@@ -93,6 +93,8 @@ EPOCH_METRIC_KEYS = (
     "loss", "auc", "auprc", "acc", "balanced_acc",
     "f1", "precision", "recall", "sensitivity", "specificity",
     "ppv", "npv", "mcc", "tp", "tn", "fp", "fn",
+    # Triple-Level Loss 分解项
+    "loss_ce", "loss_global", "loss_intra", "loss_inter", "loss_stage",
 )
 
 try:
@@ -178,12 +180,17 @@ HPARAM_KEYS = [
     "modality", "clinical_only", "use_clinical",
     "fusion_type", "clinical_hidden_dim", "clinical_in_dim",
     "label_col", "feat_path_col",
+    # SDMIL / 三重损失
+    "use_triple_loss", "triple_alpha", "triple_beta", "triple_gamma",
+    "triple_temperature", "triple_proj_dim", "triple_bank_size",
+    "triple_warmup_epochs", "triple_finetune_lr_scale", "sdmil_base",
 ]
 
 MODEL_TYPE_CHOICES = [
     "abmil", "mean_mil", "max_mil",
     "mamba_mil", "trans_mil", "s4model",
     "amd_mil", "wikg_mil", "gdf_mil",
+    "sdmil",  # Subtype-Decoupled MIL + Triple-Level Loss
 ]
 
 # 需要报告 bootstrap 95% CI 的性能指标（不含混淆矩阵计数）
@@ -226,6 +233,8 @@ KNOWN_NUMERIC = set(NUMERIC_COLS)
 # 预定义类别（训练时与数据中出现的取值取并集，保证折间维度稳定）
 # 分子分型预置四类（即使某折未出现也保留 one-hot 维度）
 MOLECULAR_CATEGORIES = ["HR+HER2-", "HR+HER2+", "TNBC", "HER2"]
+# 离散分子分型 ID（供三重损失使用）；未知 / missing → -1
+MOLECULAR_TO_ID = {c: i for i, c in enumerate(MOLECULAR_CATEGORIES)}
 KNOWN_CATEGORIES = {
     "Molecular": list(MOLECULAR_CATEGORIES),
 }
@@ -257,6 +266,21 @@ def map_label(v):
     if key not in (0, 1):
         raise ValueError(f"label 必须为 0/1 或 N-pCR/pCR，得到: {v!r}")
     return int(key)
+
+
+def molecular_to_id(raw):
+    """Molecular 字符串 → 离散 ID；无法识别返回 -1。"""
+    name = normalize_molecular_value(raw)
+    return int(MOLECULAR_TO_ID.get(name, -1))
+
+
+def wants_triple_loss(cfg):
+    """是否启用三重损失（sdmil 默认开启；可用开关显式覆盖）。"""
+    flag = cfg.get("use_triple_loss", None)
+    mt = str(cfg.get("model_type", "")).strip().lower()
+    if flag is None:
+        return mt == "sdmil"
+    return bool(flag)
 
 
 def resolve_feat_path_col(df, preferred=None):
@@ -406,7 +430,7 @@ class PathomicClassificationModel(nn.Module):
             self.classifier = nn.Linear(mil_dim, n_classes)
         self.apply(_init_weights)
 
-    def forward(self, x, clinical=None):
+    def forward(self, x, clinical=None, return_dict=False):
         bag_repr = self.backbone(x)
         if self.use_clinical:
             if clinical is None:
@@ -416,8 +440,11 @@ class PathomicClassificationModel(nn.Module):
             fused = self.fusion(bag_repr, clin_emb)
             logits = self.classifier(fused)
         else:
+            fused = bag_repr
             logits = self.classifier(bag_repr)
-        return logits
+        if not return_dict:
+            return logits
+        return {"logits": logits, "bag_repr": bag_repr, "fused": fused}
 
 
 class ClinicalOnlyModel(nn.Module):
@@ -439,11 +466,14 @@ class ClinicalOnlyModel(nn.Module):
         )
         self.apply(_init_weights)
 
-    def forward(self, x=None, clinical=None):
+    def forward(self, x=None, clinical=None, return_dict=False):
         if clinical is None:
             raise ValueError("clinical_only 模式必须提供 clinical 特征")
         clin = clinical.unsqueeze(0) if clinical.dim() == 1 else clinical
-        return self.net(clin)
+        logits = self.net(clin)
+        if not return_dict:
+            return logits
+        return {"logits": logits}
 
 
 def normalize_modality(cfg):
@@ -480,7 +510,15 @@ def normalize_modality(cfg):
 
 
 def build_backbone(cfg):
-    mt = cfg["model_type"]
+    mt = str(cfg["model_type"]).strip().lower()
+    # sdmil 可指定底层聚合器（默认 abmil）
+    if mt == "sdmil":
+        base = str(cfg.get("sdmil_base") or "abmil").strip().lower()
+        if base == "sdmil":
+            base = "abmil"
+        cfg_base = dict(cfg)
+        cfg_base["model_type"] = base
+        return build_backbone(cfg_base)
     if mt == "abmil":
         return ABMILBackbone(cfg["in_dim"], dropout=cfg["drop_out"], hidden=cfg["hidden_dim"])
     if mt == "mean_mil":
@@ -502,10 +540,16 @@ def build_backbone(cfg):
 def build_model(cfg, device):
     modality = normalize_modality(cfg)
     clinical_in_dim = int(cfg.get("clinical_in_dim", 0) or 0)
+    mt = str(cfg.get("model_type", "")).strip().lower()
 
     if modality == "clinical":
         if clinical_in_dim <= 0:
             raise ValueError("modality=clinical 需要有效的 clinical_in_dim（请检查临床列）")
+        if mt == "sdmil" or wants_triple_loss(cfg):
+            raise ValueError(
+                "sdmil / triple_loss 依赖病理 bag 表征，不支持 modality=clinical；"
+                "请使用 pathology 或 pathomic"
+            )
         # clinical_hidden_dim 优先，否则回退 hidden_dim
         h = int(cfg.get("clinical_hidden_dim") or cfg.get("hidden_dim") or 256)
         model = ClinicalOnlyModel(
@@ -516,6 +560,25 @@ def build_model(cfg, device):
 
     backbone = build_backbone(cfg)
     use_clinical = (modality == "pathomic") and clinical_in_dim > 0
+
+    # SDMIL 或显式开启三重损失：投影头 + 可学习分型原型
+    if mt == "sdmil" or wants_triple_loss(cfg):
+        from mil_models.SDMIL import SubtypeDecoupledMIL
+
+        model = SubtypeDecoupledMIL(
+            backbone,
+            n_classes=cfg["n_classes"],
+            clinical_in_dim=clinical_in_dim,
+            fusion_type=cfg.get("fusion_type", "concat"),
+            hidden_dim=cfg["hidden_dim"],
+            dropout=cfg["drop_out"],
+            use_clinical=use_clinical,
+            proj_dim=int(cfg.get("triple_proj_dim", 128) or 128),
+            n_subtypes=len(MOLECULAR_CATEGORIES),
+            build_fusion_fn=build_fusion,
+        )
+        return model.to(device)
+
     model = PathomicClassificationModel(
         backbone, cfg["n_classes"], clinical_in_dim,
         fusion_type=cfg.get("fusion_type", "concat"),
@@ -900,7 +963,7 @@ def build_patient_table(df, label_col="label", feat_path_col=None, require_feats
 
 
 class PCRBagDataset(torch.utils.data.Dataset):
-    """患者级数据集；每个样本返回 bag 特征 + 临床向量 + 二分类标签。"""
+    """患者级数据集；每个样本返回 bag 特征 + 临床向量 + 二分类标签 + 分型 ID。"""
 
     def __init__(self, pt_df, feat_key, max_slides_train, training,
                  clinical_encoder=None, clinical_only=False):
@@ -916,6 +979,12 @@ class PCRBagDataset(torch.utils.data.Dataset):
             self.clinical_matrix = None
         if self.clinical_only and self.clinical_matrix is None:
             raise ValueError("clinical_only 模式需要有效的 clinical_encoder")
+        if "Molecular" in self.pt.columns:
+            self.subtype_ids = [
+                molecular_to_id(v) for v in self.pt["Molecular"].tolist()
+            ]
+        else:
+            self.subtype_ids = [-1] * len(self.pt)
 
     def __len__(self):
         return len(self.pt)
@@ -942,12 +1011,13 @@ class PCRBagDataset(torch.utils.data.Dataset):
             arrs = [load_features(p, self.feat_key) for p in paths]
             feats = torch.from_numpy(np.concatenate(arrs, axis=0)).float()
 
-        return feats, clinical, int(row["y"]), str(row["case_id"])
+        subtype_id = int(self.subtype_ids[idx])
+        return feats, clinical, int(row["y"]), str(row["case_id"]), subtype_id
 
 
 def collate_bag(batch):
-    feats, clinical, label, cid = batch[0]
-    return feats, clinical, label, cid
+    feats, clinical, label, cid, subtype_id = batch[0]
+    return feats, clinical, label, cid, subtype_id
 
 
 def make_loader(pt_df, cfg, training, clinical_encoder=None):
@@ -989,15 +1059,18 @@ def prepare_clinical_encoder(pt_train, cfg, out_dir=None):
     return encoder
 
 
-def model_forward(model, feats, clinical, cfg, device):
+def model_forward(model, feats, clinical, cfg, device, return_dict=False):
     modality = normalize_modality(cfg)
     if modality == "clinical":
         clinical = clinical.to(device, non_blocking=True)
-        return model(None, clinical)
+        out = model(None, clinical)
+        if return_dict and not isinstance(out, dict):
+            return {"logits": out}
+        return out
     if modality == "pathomic" and int(cfg.get("clinical_in_dim", 0) or 0) > 0:
         clinical = clinical.to(device, non_blocking=True)
-        return model(feats, clinical)
-    return model(feats, None)
+        return model(feats, clinical, return_dict=return_dict)
+    return model(feats, None, return_dict=return_dict)
 
 
 # ============================================================================
@@ -1498,24 +1571,87 @@ def is_subgroup_split_meta(split_meta):
 # ============================================================================
 # 训练 / 验证
 # ============================================================================
-def run_epoch(model, loader, optimizer, cfg, device, train=True):
+def resolve_triple_stage_weights(epoch, cfg):
+    """
+    分阶段损失权重：
+      Warm-up  : CE + α L_Global（β=γ=0）
+      Fine-tune: CE + α L_Global + β L_Intra + γ L_Inter
+    """
+    alpha = float(cfg.get("triple_alpha", 0.5) or 0.0)
+    beta = float(cfg.get("triple_beta", 0.5) or 0.0)
+    gamma = float(cfg.get("triple_gamma", 0.5) or 0.0)
+    warmup = int(cfg.get("triple_warmup_epochs", 20) or 0)
+    if int(epoch) < warmup:
+        return alpha, 0.0, 0.0, "warmup"
+    return alpha, beta, gamma, "finetune"
+
+
+def build_triple_criterion(cfg, device):
+    from mil_models.SDMIL import TripleLevelLoss
+
+    crit = TripleLevelLoss(
+        temperature=float(cfg.get("triple_temperature", 0.07) or 0.07),
+        alpha=float(cfg.get("triple_alpha", 0.5) or 0.0),
+        beta=float(cfg.get("triple_beta", 0.5) or 0.0),
+        gamma=float(cfg.get("triple_gamma", 0.5) or 0.0),
+        bank_size=int(cfg.get("triple_bank_size", 256) or 256),
+        proj_dim=int(cfg.get("triple_proj_dim", 128) or 128),
+    )
+    return crit.to(device)
+
+
+def run_epoch(model, loader, optimizer, cfg, device, train=True,
+              triple_criterion=None, epoch=0):
     model.train() if train else model.eval()
     total_loss = 0.0
+    sum_ce = sum_g = sum_intra = sum_inter = 0.0
     ys, probs, preds = [], [], []
     gc = max(1, int(cfg["gc"]))
+    use_triple = triple_criterion is not None and wants_triple_loss(cfg)
     criterion = nn.CrossEntropyLoss()
     if train:
         optimizer.zero_grad()
 
-    for i, (feats, clinical, label, _cid) in enumerate(loader):
+    if use_triple:
+        alpha, beta, gamma, stage = resolve_triple_stage_weights(epoch, cfg)
+        triple_criterion.set_weights(alpha=alpha, beta=beta, gamma=gamma)
+    else:
+        stage = "ce_only"
+
+    for i, (feats, clinical, label, _cid, subtype_id) in enumerate(loader):
         feats = feats.to(device, non_blocking=True)
         label_t = torch.tensor([label], device=device, dtype=torch.long)
 
         with torch.set_grad_enabled(train):
-            logits = model_forward(model, feats, clinical, cfg, device)
-            if logits.dim() == 1:
-                logits = logits.unsqueeze(0)
-            loss = criterion(logits, label_t)
+            if use_triple:
+                out = model_forward(
+                    model, feats, clinical, cfg, device, return_dict=True
+                )
+                logits = out["logits"]
+                if logits.dim() == 1:
+                    logits = logits.unsqueeze(0)
+                loss, details = triple_criterion(
+                    logits,
+                    label_t,
+                    z=out.get("z"),
+                    subtype_id=subtype_id,
+                    prototypes=out.get("prototypes"),
+                    update_bank=bool(train),
+                    use_global=(alpha != 0),
+                    use_intra=(beta != 0),
+                    use_inter=(gamma != 0),
+                )
+                sum_ce += details["loss_ce"]
+                sum_g += details["loss_global"]
+                sum_intra += details["loss_intra"]
+                sum_inter += details["loss_inter"]
+            else:
+                logits = model_forward(model, feats, clinical, cfg, device)
+                if isinstance(logits, dict):
+                    logits = logits["logits"]
+                if logits.dim() == 1:
+                    logits = logits.unsqueeze(0)
+                loss = criterion(logits, label_t)
 
         if train:
             (loss / gc).backward()
@@ -1530,9 +1666,16 @@ def run_epoch(model, loader, optimizer, cfg, device, train=True):
         probs.append(prob1)
         preds.append(pred)
 
-    avg_loss = total_loss / max(1, len(loader))
+    n = max(1, len(loader))
+    avg_loss = total_loss / n
     metrics = compute_cls_metrics(ys, probs, preds)
     metrics["loss"] = avg_loss
+    metrics["loss_stage"] = stage
+    if use_triple:
+        metrics["loss_ce"] = sum_ce / n
+        metrics["loss_global"] = sum_g / n
+        metrics["loss_intra"] = sum_intra / n
+        metrics["loss_inter"] = sum_inter / n
     return metrics
 
 
@@ -1552,10 +1695,12 @@ def predict_patient_table(model, pt_df, cfg, device, clinical_encoder=None):
             mol_map[str(row["case_id"])] = normalize_molecular_value(row["Molecular"])
 
     rows = []
-    for feats, clinical, label, cid in loader:
+    for feats, clinical, label, cid, _subtype_id in loader:
         if modality != "clinical":
             feats = feats.to(device, non_blocking=True)
         logits = model_forward(model, feats, clinical, cfg, device)
+        if isinstance(logits, dict):
+            logits = logits["logits"]
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
         prob1 = float(torch.softmax(logits, dim=-1)[0, 1].detach().cpu().item())
@@ -1627,6 +1772,25 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
         if pt_val is not None else None
     )
 
+    use_triple = wants_triple_loss(cfg)
+    triple_criterion = build_triple_criterion(cfg, device) if use_triple else None
+    warmup_epochs = int(cfg.get("triple_warmup_epochs", 20) or 0)
+    finetune_lr_scale = float(cfg.get("triple_finetune_lr_scale", 0.1) or 0.1)
+    base_lrs = [float(g["lr"]) for g in optimizer.param_groups]
+    stage_switched = False
+
+    if use_triple:
+        print(
+            f"[{fold_tag}] Triple-Level Loss 已启用: "
+            f"α={cfg.get('triple_alpha', 0.5)}, β={cfg.get('triple_beta', 0.5)}, "
+            f"γ={cfg.get('triple_gamma', 0.5)}, τ={cfg.get('triple_temperature', 0.07)}, "
+            f"bank={cfg.get('triple_bank_size', 256)}, "
+            f"warmup_epochs={warmup_epochs}, finetune_lr_scale={finetune_lr_scale}"
+        )
+        print(
+            f"[{fold_tag}] 分型原型数={len(MOLECULAR_CATEGORIES)}: {MOLECULAR_CATEGORIES}"
+        )
+
     history = []
     best_auc, best_epoch = -1.0, -1
     best_loss = float("inf")
@@ -1658,11 +1822,28 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
         print(f"[{fold_tag}] 无验证集，跳过早停（all_train）")
 
     for epoch in range(cfg["max_epochs"]):
-        tr = run_epoch(model, train_loader, optimizer, cfg, device, train=True)
+        # 第二阶段：引入 L_Intra / L_Inter，并下调学习率
+        if use_triple and (not stage_switched) and epoch >= warmup_epochs:
+            for g, base_lr in zip(optimizer.param_groups, base_lrs):
+                g["lr"] = base_lr * finetune_lr_scale
+            stage_switched = True
+            print(
+                f"[{fold_tag}] 进入 Fine-tune 阶段 (epoch={epoch}): "
+                f"启用 L_Intra/L_Inter，lr *= {finetune_lr_scale} "
+                f"→ {[float(g['lr']) for g in optimizer.param_groups]}"
+            )
+
+        tr = run_epoch(
+            model, train_loader, optimizer, cfg, device, train=True,
+            triple_criterion=triple_criterion, epoch=epoch,
+        )
         rec = {"epoch": epoch}
         rec.update(prefix_epoch_metrics(tr, "train_"))
         if val_loader is not None:
-            va = run_epoch(model, val_loader, optimizer, cfg, device, train=False)
+            va = run_epoch(
+                model, val_loader, optimizer, cfg, device, train=False,
+                triple_criterion=triple_criterion, epoch=epoch,
+            )
             rec.update(prefix_epoch_metrics(va, "val_"))
             # 选模仍优先按 val AUC；AUC 不可用时回退到 val ACC
             score = va["auc"] if va["auc"] == va["auc"] else va["acc"]
@@ -1692,6 +1873,15 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
                 )
                 rec["early_stop_bad_epochs"] = bad_epochs
 
+            loss_extra = ""
+            if use_triple:
+                loss_extra = (
+                    f" stage={tr.get('loss_stage', '?')}"
+                    f" ce={tr.get('loss_ce', float('nan')):.4f}"
+                    f" g={tr.get('loss_global', float('nan')):.4f}"
+                    f" intra={tr.get('loss_intra', float('nan')):.4f}"
+                    f" inter={tr.get('loss_inter', float('nan')):.4f}"
+                )
             print(
                 f"[{fold_tag} epoch {epoch}] "
                 f"train_loss={tr['loss']:.4f} train_auc={tr['auc']:.4f} "
@@ -1699,17 +1889,28 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
                 f"val_acc={va['acc']:.4f} val_f1={va['f1']:.4f} "
                 f"val_P={va['precision']:.4f} val_R={va['recall']:.4f} "
                 f"val_spec={va['specificity']:.4f}"
+                + loss_extra
                 + (f" bad={bad_epochs}/{patience}" if early_stop else "")
             )
         else:
             if tr["loss"] < best_loss:
                 best_loss, best_epoch = tr["loss"], epoch
                 torch.save(model.state_dict(), ckpt_best_loss)
+            loss_extra = ""
+            if use_triple:
+                loss_extra = (
+                    f" stage={tr.get('loss_stage', '?')}"
+                    f" ce={tr.get('loss_ce', float('nan')):.4f}"
+                    f" g={tr.get('loss_global', float('nan')):.4f}"
+                    f" intra={tr.get('loss_intra', float('nan')):.4f}"
+                    f" inter={tr.get('loss_inter', float('nan')):.4f}"
+                )
             print(
                 f"[{fold_tag} epoch {epoch}] "
                 f"train_loss={tr['loss']:.4f} train_auc={tr['auc']:.4f} "
                 f"train_acc={tr['acc']:.4f} train_f1={tr['f1']:.4f} "
                 f"train_P={tr['precision']:.4f} train_R={tr['recall']:.4f}"
+                + loss_extra
             )
 
         history.append(rec)
@@ -2444,6 +2645,8 @@ def build_config(args):
         print(f"已从 {args.config} 覆盖超参数: "
               f"{[k for k in override if k in HPARAM_KEYS]}")
     cfg["n_classes"] = 2
+    # 解析三重损失开关：None → sdmil 默认开，其余默认关
+    cfg["use_triple_loss"] = wants_triple_loss(cfg)
     return cfg
 
 
@@ -2619,6 +2822,46 @@ def get_args():
     p.add_argument("--gdf_act", type=str, default="leaky_relu")
     p.add_argument("--gdf_lambda_smooth", type=float, default=0.0)
     p.add_argument("--gdf_lambda_nce", type=float, default=0.0)
+
+    # SDMIL / Triple-Level Loss
+    p.add_argument(
+        "--use_triple_loss",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="启用三重损失（Global/Intra/Inter）。"
+             "model_type=sdmil 时默认开启；其他模型默认关闭。"
+             "可用 --use_triple_loss / --no-use_triple_loss 显式控制",
+    )
+    p.add_argument(
+        "--sdmil_base",
+        type=str,
+        default="abmil",
+        help="sdmil 底层 MIL 聚合器（默认 abmil；也可 mean_mil/max_mil/amd_mil 等）",
+    )
+    p.add_argument("--triple_alpha", type=float, default=0.5,
+                   help="L_Global 权重 α")
+    p.add_argument("--triple_beta", type=float, default=0.5,
+                   help="L_Intra 权重 β")
+    p.add_argument("--triple_gamma", type=float, default=0.5,
+                   help="L_Inter 权重 γ")
+    p.add_argument("--triple_temperature", type=float, default=0.07,
+                   help="对比损失温度 τ")
+    p.add_argument("--triple_proj_dim", type=int, default=128,
+                   help="对比投影维 / 分型原型维")
+    p.add_argument("--triple_bank_size", type=int, default=256,
+                   help="特征 Memory Bank 大小（batch_size=1 时用于对比）")
+    p.add_argument(
+        "--triple_warmup_epochs",
+        type=int,
+        default=20,
+        help="Warm-up 轮数：仅 CE+L_Global；之后引入 L_Intra/L_Inter",
+    )
+    p.add_argument(
+        "--triple_finetune_lr_scale",
+        type=float,
+        default=0.1,
+        help="进入 Fine-tune 阶段时学习率缩放系数（默认 0.1）",
+    )
 
     return p.parse_args()
 

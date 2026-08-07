@@ -8,7 +8,7 @@
 | [`main_pcr_infer.py`](main_pcr_infer.py) | **推理**入口 |
 | [`make_kfold_splits.py`](make_kfold_splits.py) | 独立 K 折划分 |
 | [`make_kfold_splits_and_test.py`](make_kfold_splits_and_test.py) | 先划独立 test，再对剩余做 K 折 |
-| [`mil_models/`](mil_models/) | 自 MIL_BASELINE 扩展的 MIL（`amd_mil` / `wikg_mil` / `gdf_mil`） |
+| [`mil_models/`](mil_models/) | 自 MIL_BASELINE 扩展的 MIL（`amd_mil` / `wikg_mil` / `gdf_mil`）+ **SDMIL / 三重损失** |
 | [`MambaMIL/`](MambaMIL/) | vendored [MambaMIL](https://github.com/isyangshu/MambaMIL)（`mamba_mil` / `trans_mil` / `s4model`） |
 | [`requirements.txt`](requirements.txt) | 基础依赖 |
 | [`requirements_mamba.txt`](requirements_mamba.txt) / [`scripts/install_mamba.sh`](scripts/install_mamba.sh) | Mamba CUDA 扩展安装 |
@@ -235,10 +235,50 @@ pip install einops torch_geometric   # amd / wikg+gdf
 | `amd_mil` | `mil_models/AMD_MIL` | `amd_embed_dim`（默认 `hidden_dim`） | `einops` |
 | `wikg_mil` | `mil_models/WIKG_MIL` | `wikg_dim_hidden`（默认 `hidden_dim`） | `torch_geometric` |
 | `gdf_mil` | `mil_models/GDF_MIL` | `gdf_out_dim`（默认 128） | `torch_geometric` |
+| `sdmil` | `mil_models/SDMIL` | `hidden_dim` | —（默认开启三重损失） |
 
 常用超参：`--amd_agent_num`、`--wikg_topk` / `--wikg_agg_type`、`--gdf_k_components` / `--gdf_k_neighbors`。
 
-仅临床模式 `modality=clinical` 仍走独立 MLP，与 `model_type` 无关。
+仅临床模式 `modality=clinical` 仍走独立 MLP，与 `model_type` 无关；**不支持** `sdmil` / 三重损失。
+
+### SDMIL + 三重损失（创新模块）
+
+核心思想：解耦「跨分型通用预后特征」与「分型特异预后特征」。
+
+```
+bag → MIL backbone → h ─┬→ ProjectionHead → z ──→ L_Global / L_Intra（Memory Bank）
+                        │                   └→ 对齐可学习原型 C_k → L_Inter
+                        └→ (+ clinical fusion) → CE
+```
+
+总损失：`L = L_CE + α L_Global + β L_Intra + γ L_Inter`
+
+| 损失 | 作用 |
+| --- | --- |
+| `L_Global` | 忽略分型，按 pCR 标签做 SupCon（跨分型不变性） |
+| `L_Intra` | 仅同分子分型内对比（分型内特异性 / 难例负样本） |
+| `L_Inter` | 对齐自身分型原型、排斥其他原型（保留生物学分型差异） |
+
+分阶段训练：
+1. **Warm-up**（前 `--triple_warmup_epochs`，默认 20）：`CE + α L_Global`
+2. **Fine-tune**：引入 `L_Intra/L_Inter`，学习率 × `--triple_finetune_lr_scale`（默认 0.1）
+
+```bash
+# 推荐：SDMIL（默认 abmil 聚合 + 三重损失）
+python main_pcr_train.py --split_mode kfold \
+    --splits_path ./splits/mol_label_k5_test0.2 \
+    --model_type sdmil --modality pathomic \
+    --triple_alpha 0.5 --triple_beta 0.5 --triple_gamma 0.5 \
+    --triple_warmup_epochs 20 --triple_bank_size 256 \
+    --log_root ./logs --exp_name sdmil_triple
+
+# 也可把三重损失挂到其他 backbone（会自动换上投影头+原型）
+python main_pcr_train.py --splits_path ./splits/mol_label_k5_test0.2 \
+    --model_type amd_mil --use_triple_loss \
+    --log_root ./logs --exp_name amd_triple
+```
+
+相关超参：`--sdmil_base`、`--triple_temperature`、`--triple_proj_dim`、`--triple_bank_size`、`--no-use_triple_loss`。
 
 ### 主要超参数
 
