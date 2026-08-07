@@ -5,3 +5,7 @@ pandas
 pyyaml
 scikit-learn
 h5py
+
+# MIL_BASELINE 扩展模型（按需安装）
+einops                 # amd_mil
+torch_geometric        # wikg_mil / gdf_mil

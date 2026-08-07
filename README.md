@@ -8,6 +8,7 @@
 | [`main_pcr_infer.py`](main_pcr_infer.py) | **推理**入口 |
 | [`make_kfold_splits.py`](make_kfold_splits.py) | 独立 K 折划分 |
 | [`make_kfold_splits_and_test.py`](make_kfold_splits_and_test.py) | 先划独立 test，再对剩余做 K 折 |
+| [`mil_models/`](mil_models/) | 自 MIL_BASELINE 扩展的 MIL（`amd_mil` / `wikg_mil` / `gdf_mil`） |
 | [`MambaMIL/`](MambaMIL/) | vendored [MambaMIL](https://github.com/isyangshu/MambaMIL)（`mamba_mil` / `trans_mil` / `s4model`） |
 | [`requirements.txt`](requirements.txt) | 基础依赖 |
 | [`requirements_mamba.txt`](requirements_mamba.txt) / [`scripts/install_mamba.sh`](scripts/install_mamba.sh) | Mamba CUDA 扩展安装 |
@@ -221,6 +222,22 @@ bash scripts/install_mamba.sh
 # 或：pip install -r requirements_mamba.txt && pip install ./MambaMIL/mamba
 ```
 
+自 [`MIL_BASELINE`](../MIL_BASELINE) 扩展的 `amd_mil` / `wikg_mil` / `gdf_mil` 同样截到 bag 表征后接临床中期融合；源码在 [`mil_models/`](mil_models/)。依赖：
+
+```bash
+pip install einops torch_geometric   # amd / wikg+gdf
+```
+
+| `--model_type` | 来源 | bag 维 | 额外依赖 |
+| --- | --- | --- | --- |
+| `abmil` / `mean_mil` / `max_mil` | 本地 | `hidden_dim` | — |
+| `mamba_mil` / `trans_mil` / `s4model` | `MambaMIL/` | 512 | mamba CUDA 扩展（mamba） |
+| `amd_mil` | `mil_models/AMD_MIL` | `amd_embed_dim`（默认 `hidden_dim`） | `einops` |
+| `wikg_mil` | `mil_models/WIKG_MIL` | `wikg_dim_hidden`（默认 `hidden_dim`） | `torch_geometric` |
+| `gdf_mil` | `mil_models/GDF_MIL` | `gdf_out_dim`（默认 128） | `torch_geometric` |
+
+常用超参：`--amd_agent_num`、`--wikg_topk` / `--wikg_agg_type`、`--gdf_k_components` / `--gdf_k_neighbors`。
+
 仅临床模式 `modality=clinical` 仍走独立 MLP，与 `model_type` 无关。
 
 ### 主要超参数
@@ -230,7 +247,7 @@ bash scripts/install_mamba.sh
 | `--splits_path` | **必填** | 预划分 yaml/json 或目录 |
 | `--split_mode` | `kfold` | `kfold` / `all_train` |
 | `--modality` | `pathomic` | 见上表 |
-| `--model_type` | `abmil` | `abmil` / `mean_mil` / `max_mil` / `mamba_mil` / `trans_mil` / `s4model` |
+| `--model_type` | `abmil` | 见上表（含 amd/wikg/gdf） |
 | `--fusion_type` | `concat` | 中期融合 |
 | `--max_epochs` | `50` | 最大轮数 |
 | `--lr` | `1e-4` | 学习率 |
@@ -338,4 +355,6 @@ python main_pcr_infer.py \
 
 ## 六、依赖
 
-`torch`, `numpy`, `pandas`, `scikit-learn`, `h5py`, `PyYAML`
+基础：`torch`, `numpy`, `pandas`, `scikit-learn`, `h5py`, `PyYAML`
+
+扩展模型（按需）：`einops`（`amd_mil`）、`torch_geometric`（`wikg_mil` / `gdf_mil`）

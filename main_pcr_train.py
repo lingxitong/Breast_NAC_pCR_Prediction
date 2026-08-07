@@ -170,9 +170,20 @@ HPARAM_KEYS = [
     "early_stop", "patience", "min_delta", "early_stop_metric",
     "n_boot", "bootstrap_ci",
     "mambamil_layer", "mambamil_rate", "mambamil_type",
+    # MIL_BASELINE 扩展：AMD / WIKG / GDF
+    "amd_embed_dim", "amd_agent_num", "amd_act",
+    "wikg_dim_hidden", "wikg_topk", "wikg_agg_type", "wikg_pool", "wikg_act",
+    "gdf_hid_dim", "gdf_out_dim", "gdf_k_components", "gdf_k_neighbors",
+    "gdf_act", "gdf_lambda_smooth", "gdf_lambda_nce",
     "modality", "clinical_only", "use_clinical",
     "fusion_type", "clinical_hidden_dim", "clinical_in_dim",
     "label_col", "feat_path_col",
+]
+
+MODEL_TYPE_CHOICES = [
+    "abmil", "mean_mil", "max_mil",
+    "mamba_mil", "trans_mil", "s4model",
+    "amd_mil", "wikg_mil", "gdf_mil",
 ]
 
 # 需要报告 bootstrap 95% CI 的性能指标（不含混淆矩阵计数）
@@ -481,6 +492,10 @@ def build_backbone(cfg):
     if mt in ("mamba_mil", "trans_mil", "s4model"):
         # 作为特征 backbone：输出 bag 表征，供 pathomic 中期融合 / pathology 分类头使用
         return _build_repo_backbone(cfg)
+    if mt in ("amd_mil", "wikg_mil", "gdf_mil"):
+        # 来自 MIL_BASELINE 的扩展模型，同样截到 bag 表征
+        from mil_models import build_baseline_backbone
+        return build_baseline_backbone(cfg)
     raise NotImplementedError(f"未知 model_type: {mt}")
 
 
@@ -2542,8 +2557,10 @@ def get_args():
 
     # 模型
     p.add_argument("--model_type",
-                   choices=["abmil", "mean_mil", "max_mil", "mamba_mil", "trans_mil", "s4model"],
-                   default="abmil")
+                   choices=MODEL_TYPE_CHOICES,
+                   default="abmil",
+                   help="MIL backbone：本地 abmil/mean/max；MambaMIL 仓库 mamba/trans/s4；"
+                        "MIL_BASELINE 扩展 amd/wikg/gdf")
     p.add_argument("--in_dim", type=int, default=-1, help="特征维度，<=0 时从特征文件自动推断")
     p.add_argument("--hidden_dim", type=int, default=512)
     p.add_argument("--max_slides_train", type=int, default=3,
@@ -2578,6 +2595,30 @@ def get_args():
     p.add_argument("--mambamil_layer", type=int, default=2)
     p.add_argument("--mambamil_rate", type=int, default=10)
     p.add_argument("--mambamil_type", choices=["Mamba", "BiMamba", "SRMamba"], default="SRMamba")
+
+    # MIL_BASELINE 扩展：AMD_MIL
+    p.add_argument("--amd_embed_dim", type=int, default=None,
+                   help="AMD_MIL embed_dim，默认回退 hidden_dim")
+    p.add_argument("--amd_agent_num", type=int, default=256)
+    p.add_argument("--amd_act", type=str, default="relu")
+
+    # MIL_BASELINE 扩展：WIKG_MIL
+    p.add_argument("--wikg_dim_hidden", type=int, default=None,
+                   help="WIKG_MIL dim_hidden，默认回退 hidden_dim")
+    p.add_argument("--wikg_topk", type=int, default=6)
+    p.add_argument("--wikg_agg_type", choices=["gcn", "sage", "bi-interaction"],
+                   default="bi-interaction")
+    p.add_argument("--wikg_pool", type=str, default="attn")
+    p.add_argument("--wikg_act", type=str, default="LeakyReLU")
+
+    # MIL_BASELINE 扩展：GDF_MIL
+    p.add_argument("--gdf_hid_dim", type=int, default=256)
+    p.add_argument("--gdf_out_dim", type=int, default=128)
+    p.add_argument("--gdf_k_components", type=int, default=10)
+    p.add_argument("--gdf_k_neighbors", type=int, default=10)
+    p.add_argument("--gdf_act", type=str, default="leaky_relu")
+    p.add_argument("--gdf_lambda_smooth", type=float, default=0.0)
+    p.add_argument("--gdf_lambda_nce", type=float, default=0.0)
 
     return p.parse_args()
 
