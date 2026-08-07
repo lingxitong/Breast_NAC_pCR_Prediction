@@ -6,7 +6,8 @@
 | --- | --- |
 | [`main_pcr_train.py`](main_pcr_train.py) | **训练**入口 |
 | [`main_pcr_infer.py`](main_pcr_infer.py) | **推理**入口 |
-| [`make_kfold_splits.py`](make_kfold_splits.py) | 独立 K 折划分（唯一划分入口） |
+| [`make_kfold_splits.py`](make_kfold_splits.py) | 独立 K 折划分 |
+| [`make_kfold_splits_and_test.py`](make_kfold_splits_and_test.py) | 先划独立 test，再对剩余做 K 折 |
 | [`MambaMIL/`](MambaMIL/) | vendored [MambaMIL](https://github.com/isyangshu/MambaMIL)（`mamba_mil` / `trans_mil` / `s4model`） |
 | [`requirements.txt`](requirements.txt) | 基础依赖 |
 | [`requirements_mamba.txt`](requirements_mamba.txt) / [`scripts/install_mamba.sh`](scripts/install_mamba.sh) | Mamba CUDA 扩展安装 |
@@ -16,7 +17,7 @@
 核心约定：
 - **标签**：`N-pCR → 0`，`pCR → 1`
 - **模态**：`pathomic`（病理+临床，默认）/ `pathology`（仅病理）/ `clinical`（仅临床）
-- **划分**：必须先跑 `make_kfold_splits.py`；训练只认 `--splits_path`，CSV 从划分文件 `meta.csv_path` 读取
+- **划分**：须先跑 `make_kfold_splits.py` 或 `make_kfold_splits_and_test.py`；训练只认 `--splits_path`，CSV 从划分文件 `meta.csv_path` 读取
 - **临床编码**：因子 `Molecular,T,N,HER2` one-hot；连续 `Age,ER,PR,Ki67` 标准化  
   Molecular 四种：`HR+HER2-` / `HR+HER2+` / `TNBC` / `HER2`
 - **指标**：AUC / AUPRC / Acc / Balanced Acc / F1 / Precision / Recall（Sensitivity）/ Specificity / PPV / NPV / MCC / TP·TN·FP·FN
@@ -25,18 +26,23 @@
 
 ```bash
 # 1) 划分（会把 csv 绝对路径写入 meta.csv_path）
+#    纯 K 折：
 python make_kfold_splits.py --csv_path example_dataset.csv \
     --out_dir ./splits/mol_label_k5 --k 5 --stratify_by Molecular_label
+#    或：先划独立 test，再对剩余做 K 折（推荐用于最终外推评估）
+python make_kfold_splits_and_test.py --csv_path example_dataset.csv \
+    --out_dir ./splits/mol_label_k5_test0.2 \
+    --k 5 --test_ratio 0.2 --stratify_by Molecular_label
 
 # 2) 训练（无需再传 --csv_path）
 python main_pcr_train.py --split_mode kfold \
-    --splits_path ./splits/mol_label_k5 \
+    --splits_path ./splits/mol_label_k5_test0.2 \
     --log_root ./logs --exp_name pcr_kfold
 
-# 3) 推理（指定训练日志目录 + 待推理 CSV）
+# 3) 推理（指定训练日志目录 + 待推理 CSV；可用划出的 test_dataset.csv）
 python main_pcr_infer.py \
     --log_dir ./logs/pcr_kfold \
-    --csv_path example_dataset.csv \
+    --csv_path ./splits/mol_label_k5_test0.2/test_dataset.csv \
     --save_dir ./infer/pcr_kfold
 ```
 
@@ -71,6 +77,12 @@ python main_pcr_infer.py \
 
 ## 二、K 折划分（独立脚本）
 
+两个划分入口，K 折逻辑一致（总体 + 与总体 fold 对齐的亚组提取）；区别是是否先留出独立 test。
+
+### 2.1 纯 K 折：`make_kfold_splits.py`
+
+对全部样本做 K 折，无独立 test：
+
 ```bash
 python make_kfold_splits.py \
     --csv_path example_dataset.csv \
@@ -94,6 +106,37 @@ splits/mol_label_k5/
     HR+HER2-/
     HR+HER2+/
 ```
+
+### 2.2 先划 test 再 K 折：`make_kfold_splits_and_test.py`
+
+先按 `--test_ratio`（患者级）划出独立 test，再对**剩余样本**做与 `make_kfold_splits.py` 相同的 K 折；test / K 折共用同一 `--stratify_by`。独立 test 以 `example_dataset.csv` 同格式落盘，可直接给 `main_pcr_infer.py`。
+
+```bash
+python make_kfold_splits_and_test.py \
+    --csv_path example_dataset.csv \
+    --out_dir ./splits/mol_label_k5_test0.2 \
+    --k 5 --seed 1 --test_ratio 0.2 --stratify_by Molecular_label
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--test_ratio` | `0.2` | 独立 test 比例（患者级），须在 `(0, 1)` |
+| `--test_csv_name` | `test_dataset.csv` | 输出的 infer 格式 CSV 文件名 |
+| `--k` / `--seed` / `--stratify_by` | 同左 | 与 `make_kfold_splits.py` 一致 |
+
+输出结构：
+
+```
+splits/mol_label_k5_test0.2/
+  split_config.yaml          # test_ratio / n_dev / n_test 等
+  test_case_ids.txt          # 独立 test 患者 ID
+  test_dataset.csv           # 独立 test，example_dataset.csv 格式（供 infer）
+  kfold_splits.yaml          # 仅含剩余样本的 train/val；meta 含 test_* 字段
+  fold_0/ ...
+  molecular_subgroups/       # 在剩余样本上、与总体 fold 对齐
+```
+
+训练仍用 `--splits_path` 指向该目录；推理时把 `--csv_path` 设为 `test_dataset.csv` 即可评估外推性能。
 
 ### `--stratify_by`
 
@@ -269,11 +312,11 @@ infer_dir/
 假设工程根目录为仓库上级，特征已按绝对路径写在 CSV 中：
 
 ```bash
-# 划分
-python make_kfold_splits.py \
+# 划分（含独立 test）
+python make_kfold_splits_and_test.py \
     --csv_path example_dataset.csv \
     --out_dir ../data_splits \
-    --k 5 --seed 1 --stratify_by Molecular_label
+    --k 5 --seed 1 --test_ratio 0.2 --stratify_by Molecular_label
 
 # 仅病理、ABMIL、短训冒烟
 python main_pcr_train.py \
@@ -284,10 +327,10 @@ python main_pcr_train.py \
     --modality pathology \
     --max_epochs 2
 
-# 用同一份 CSV 做推理
+# 用独立 test CSV 做推理
 python main_pcr_infer.py \
     --log_dir ../logs/abmil_pathology_e2 \
-    --csv_path example_dataset.csv \
+    --csv_path ../data_splits/test_dataset.csv \
     --save_dir ../infer_ans
 ```
 
