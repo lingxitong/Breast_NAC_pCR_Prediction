@@ -15,15 +15,17 @@ main_pcr.py
   * 一个患者(case)可能有多张 slide，训练时拼接成一个 bag；若 slide 数 > max_slides
     则随机选取 max_slides 张拼接；验证时拼接全部 slide。
 
-输入 CSV 格式见项目根目录 example_dataset.csv，关键列：
+输入 CSV 格式见 example_dataset.csv；带 TME 定量特征时见 tme-ceshi.csv 一类宽表：
   case_id, slide_id, slide_feats_path, label,
-  Molecular, T, N, Age, ER, PR, HER2, Ki67
+  Molecular, T, N, Age, ER, PR, HER2, Ki67, <TME 特征列...>
 其中 label 可为字符串 N-pCR/pCR，或已映射的 0/1。
 slide_feats_path 指向每张 slide 的特征文件（.pt 或 .h5）。
 临床融合白名单列：
   因子变量（one-hot）：Molecular, T, N, HER2
   连续变量（标准化）：Age, ER, PR, Ki67
 Molecular 取值（四种）：HR+HER2- / HR+HER2+ / TNBC / HER2。
+TME 列：除元信息列与临床白名单外的其余数值列；缺失值 NA 按 0 处理，
+  同一患者多张 slide 时对 TME 取均值；--use_tme 时与临床向量拼接后做中期融合。
 
 训练：
   * --split_mode 控制 kfold（默认）或 all_train。
@@ -175,8 +177,8 @@ HPARAM_KEYS = [
     "wikg_dim_hidden", "wikg_topk", "wikg_agg_type", "wikg_pool", "wikg_act",
     "gdf_hid_dim", "gdf_out_dim", "gdf_k_components", "gdf_k_neighbors",
     "gdf_act", "gdf_lambda_smooth", "gdf_lambda_nce",
-    "modality", "clinical_only", "use_clinical",
-    "fusion_type", "clinical_hidden_dim", "clinical_in_dim",
+    "modality", "clinical_only", "use_clinical", "use_tme",
+    "fusion_type", "clinical_hidden_dim", "clinical_in_dim", "tme_in_dim",
     "label_col", "feat_path_col",
 ]
 
@@ -275,6 +277,17 @@ def get_clinical_columns(df):
         if c in df.columns and c not in EXCLUDED_CLINICAL and c not in META_COLS:
             cols.append(c)
     return cols
+
+
+def get_tme_columns(df):
+    """TME 定量特征列：排除元信息列与临床白名单列。"""
+    skip = set(META_COLS) | set(CLINICAL_WHITELIST) | {"y", "label"}
+    return [c for c in df.columns if c not in skip]
+
+
+def _aggregate_tme_value(series):
+    vals = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+    return float(vals.mean()) if len(vals) else 0.0
 
 
 # ============================================================================
@@ -515,7 +528,7 @@ def build_model(cfg, device):
         return model.to(device)
 
     backbone = build_backbone(cfg)
-    use_clinical = (modality == "pathomic") and clinical_in_dim > 0
+    use_clinical = clinical_in_dim > 0 and modality in ("pathomic", "pathology")
     model = PathomicClassificationModel(
         backbone, cfg["n_classes"], clinical_in_dim,
         fusion_type=cfg.get("fusion_type", "concat"),
@@ -843,6 +856,118 @@ class ClinicalEncoder:
         return enc
 
 
+class TMEEncoder:
+    """TME 宽表数值特征：缺失填 0，训练集 z-score 标准化。"""
+
+    def __init__(self):
+        self.tme_cols = []
+        self.numeric_mean = {}
+        self.numeric_std = {}
+        self.output_dim = 0
+        self.fitted = False
+
+    def fit(self, pt_df, tme_cols=None):
+        cols = list(tme_cols or get_tme_columns(pt_df))
+        cols = [c for c in cols if c in pt_df.columns]
+        self.tme_cols = cols
+        if not cols:
+            self.fitted = True
+            self.output_dim = 0
+            return self
+        for col in cols:
+            vals = pd.to_numeric(pt_df[col], errors="coerce").fillna(0.0).astype(float)
+            mean = float(vals.mean()) if len(vals) else 0.0
+            std = float(vals.std()) if len(vals) else 1.0
+            if not np.isfinite(std) or std < 1e-6:
+                std = 1.0
+            self.numeric_mean[col] = mean
+            self.numeric_std[col] = std
+        self.output_dim = len(cols)
+        self.fitted = True
+        return self
+
+    def transform_row(self, row):
+        if not self.fitted or self.output_dim == 0:
+            return np.zeros((0,), dtype=np.float32)
+        feats = []
+        for col in self.tme_cols:
+            val = pd.to_numeric(row.get(col, 0.0), errors="coerce")
+            val = 0.0 if pd.isna(val) else float(val)
+            val = (val - self.numeric_mean[col]) / self.numeric_std[col]
+            feats.append(val)
+        return np.asarray(feats, dtype=np.float32)
+
+    def transform_df(self, pt_df):
+        return np.stack([self.transform_row(pt_df.iloc[i]) for i in range(len(pt_df))], axis=0)
+
+    def to_dict(self):
+        return {
+            "tme_cols": self.tme_cols,
+            "numeric_mean": self.numeric_mean,
+            "numeric_std": self.numeric_std,
+            "output_dim": self.output_dim,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        enc = cls()
+        enc.tme_cols = list(d.get("tme_cols", []))
+        enc.numeric_mean = {k: float(v) for k, v in d.get("numeric_mean", {}).items()}
+        enc.numeric_std = {k: float(v) for k, v in d.get("numeric_std", {}).items()}
+        enc.output_dim = int(d.get("output_dim", len(enc.tme_cols)))
+        enc.fitted = True
+        return enc
+
+
+class TabularEncoder:
+    """临床 + 可选 TME，拼接为单一辅助向量供融合使用。"""
+
+    def __init__(self, clinical=None, tme=None):
+        self.clinical = clinical
+        self.tme = tme
+
+    @property
+    def output_dim(self):
+        clin = self.clinical.output_dim if self.clinical is not None else 0
+        tme = self.tme.output_dim if self.tme is not None else 0
+        return int(clin + tme)
+
+    def transform_row(self, row):
+        parts = []
+        if self.clinical is not None and self.clinical.output_dim > 0:
+            parts.append(self.clinical.transform_row(row))
+        if self.tme is not None and self.tme.output_dim > 0:
+            parts.append(self.tme.transform_row(row))
+        if not parts:
+            return np.zeros((0,), dtype=np.float32)
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate(parts, axis=0)
+
+    def transform_df(self, pt_df):
+        return np.stack([self.transform_row(pt_df.iloc[i]) for i in range(len(pt_df))], axis=0)
+
+    def to_dict(self):
+        return {
+            "schema": "tabular_v1",
+            "clinical": self.clinical.to_dict() if self.clinical is not None else None,
+            "tme": self.tme.to_dict() if self.tme is not None else None,
+            "output_dim": self.output_dim,
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        if isinstance(payload, dict) and payload.get("schema") == "tabular_v1":
+            clinical = (
+                ClinicalEncoder.from_dict(payload["clinical"])
+                if payload.get("clinical")
+                else None
+            )
+            tme = TMEEncoder.from_dict(payload["tme"]) if payload.get("tme") else None
+            return cls(clinical=clinical, tme=tme)
+        return cls(clinical=ClinicalEncoder.from_dict(payload), tme=None)
+
+
 def save_clinical_encoder(encoder, path):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(encoder.to_dict(), f, ensure_ascii=False, indent=2)
@@ -850,7 +975,7 @@ def save_clinical_encoder(encoder, path):
 
 def load_clinical_encoder(path):
     with open(path, "r", encoding="utf-8") as f:
-        return ClinicalEncoder.from_dict(json.load(f))
+        return TabularEncoder.from_dict(json.load(f))
 
 
 def build_patient_table(df, label_col="label", feat_path_col=None, require_feats=True):
@@ -877,6 +1002,7 @@ def build_patient_table(df, label_col="label", feat_path_col=None, require_feats
         df = df.dropna(subset=["case_id", "y"])
 
     clinical_cols = get_clinical_columns(df)
+    tme_cols = get_tme_columns(df)
 
     records = []
     for case_id, g in df.groupby("case_id", sort=False):
@@ -894,9 +1020,11 @@ def build_patient_table(df, label_col="label", feat_path_col=None, require_feats
         }
         for col in clinical_cols:
             rec[col] = g[col].iloc[0]
+        for col in tme_cols:
+            rec[col] = _aggregate_tme_value(g[col])
         records.append(rec)
     pt = pd.DataFrame(records).reset_index(drop=True)
-    return pt, clinical_cols, resolved_feat_col
+    return pt, clinical_cols, resolved_feat_col, tme_cols
 
 
 class PCRBagDataset(torch.utils.data.Dataset):
@@ -962,29 +1090,50 @@ def make_loader(pt_df, cfg, training, clinical_encoder=None):
     )
 
 
-def prepare_clinical_encoder(pt_train, cfg, out_dir=None):
+def prepare_clinical_encoder(pt_train, cfg, out_dir=None, tme_cols=None):
     modality = normalize_modality(cfg)
-    if modality == "pathology":
+    use_tme = bool(cfg.get("use_tme", False))
+    if modality == "pathology" and not use_tme:
         cfg["clinical_in_dim"] = 0
+        cfg["tme_in_dim"] = 0
         return None
-    encoder = ClinicalEncoder().fit(pt_train)
+
+    clinical_encoder = None
+    if modality in ("pathomic", "clinical"):
+        clinical_encoder = ClinicalEncoder().fit(pt_train)
+
+    tme_encoder = None
+    if use_tme:
+        cols = list(tme_cols or get_tme_columns(pt_train))
+        tme_encoder = TMEEncoder().fit(pt_train, cols)
+        if tme_encoder.output_dim <= 0:
+            raise ValueError("use_tme=True 但未在 CSV 中找到 TME 特征列")
+
+    encoder = TabularEncoder(clinical=clinical_encoder, tme=tme_encoder)
     cfg["clinical_in_dim"] = int(encoder.output_dim)
+    cfg["tme_in_dim"] = int(tme_encoder.output_dim if tme_encoder is not None else 0)
     if cfg["clinical_in_dim"] <= 0:
         raise ValueError(
-            f"modality={modality} 需要临床特征，但编码后维度为 0；"
-            f"请检查 CSV 是否包含白名单列 {CLINICAL_WHITELIST}"
+            f"modality={modality}, use_tme={use_tme} 需要辅助特征，但编码后维度为 0；"
+            f"请检查 CSV 是否包含临床白名单列 {CLINICAL_WHITELIST} 或 TME 列"
         )
     if out_dir is not None:
         save_clinical_encoder(encoder, os.path.join(out_dir, "clinical_encoder.json"))
-    print(f"临床特征维度: {encoder.output_dim}  "
-          f"(连续变量 {len(encoder.numeric_cols)}, 因子变量 {len(encoder.categorical_cols)})")
-    if encoder.numeric_cols:
-        print(f"  连续变量(标准化): {encoder.numeric_cols}")
-    if encoder.categorical_cols:
-        print(f"  因子变量(one-hot): {encoder.categorical_cols}")
-        for col in encoder.categorical_cols:
-            print(f"    {col}: {encoder.cat_categories.get(col, [])}")
-    print(f"  白名单: {CLINICAL_WHITELIST}")
+    if clinical_encoder is not None and clinical_encoder.output_dim > 0:
+        print(
+            f"临床特征维度: {clinical_encoder.output_dim}  "
+            f"(连续 {len(clinical_encoder.numeric_cols)}, "
+            f"因子 {len(clinical_encoder.categorical_cols)})"
+        )
+        if clinical_encoder.numeric_cols:
+            print(f"  连续变量(标准化): {clinical_encoder.numeric_cols}")
+        if clinical_encoder.categorical_cols:
+            print(f"  因子变量(one-hot): {clinical_encoder.categorical_cols}")
+    if tme_encoder is not None and tme_encoder.output_dim > 0:
+        print(f"TME 特征维度: {tme_encoder.output_dim}（缺失 NA→0，病例内 slide 取均值，z-score）")
+        print(f"  示例列: {tme_encoder.tme_cols[:3]} ...")
+    print(f"融合辅助向量总维度: {encoder.output_dim}")
+    print(f"  白名单临床列: {CLINICAL_WHITELIST}")
     print(f"  元信息/禁止列: {sorted(META_COLS | EXCLUDED_CLINICAL)}")
     return encoder
 
@@ -994,9 +1143,12 @@ def model_forward(model, feats, clinical, cfg, device):
     if modality == "clinical":
         clinical = clinical.to(device, non_blocking=True)
         return model(None, clinical)
-    if modality == "pathomic" and int(cfg.get("clinical_in_dim", 0) or 0) > 0:
+    aux_dim = int(cfg.get("clinical_in_dim", 0) or 0)
+    if aux_dim > 0 and modality in ("pathomic", "pathology"):
         clinical = clinical.to(device, non_blocking=True)
+        feats = feats.to(device, non_blocking=True)
         return model(feats, clinical)
+    feats = feats.to(device, non_blocking=True)
     return model(feats, None)
 
 
@@ -1618,7 +1770,9 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
     os.makedirs(out_dir, exist_ok=True)
     set_seed(cfg["seed"])
 
-    encoder = prepare_clinical_encoder(pt_train, cfg, out_dir)
+    encoder = prepare_clinical_encoder(
+        pt_train, cfg, out_dir, tme_cols=cfg.get("tme_cols")
+    )
     model = build_model(cfg, device)
     optimizer = get_optimizer(model, cfg)
     train_loader = make_loader(pt_train, cfg, training=True, clinical_encoder=encoder)
@@ -2586,7 +2740,13 @@ def get_args():
                    help="兼容旧开关：--no-use_clinical 等价于 --modality pathology；"
                         "在 pathomic 下是否融合临床（由 modality 最终决定）")
     p.add_argument("--fusion_type", choices=["concat", "bilinear", "gated"], default="concat",
-                   help="MIL 全局表征与临床嵌入的中期融合方式（仅 pathomic）")
+                   help="MIL 全局表征与临床嵌入的中期融合方式（pathomic / pathology+TME）")
+    p.add_argument(
+        "--use_tme",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="是否拼接 TME 宽表特征（缺失 NA→0）；与临床向量拼接后做 concat/bilinear/gated 融合",
+    )
     p.add_argument("--clinical_hidden_dim", type=int, default=256,
                    help="临床 MLP 隐藏维；clinical_only 时作为分类器宽度，"
                         "pathomic 时嵌入维 = max(32, hidden_dim//2)")
@@ -2650,13 +2810,14 @@ def main():
     print(f"CSV: {csv_path}")
 
     df = read_csv_smart(csv_path)
-    pt, clinical_cols, feat_col = build_patient_table(
+    pt, clinical_cols, feat_col, tme_cols = build_patient_table(
         df,
         label_col=cfg.get("label_col", "label"),
         feat_path_col=cfg.get("feat_path_col"),
         require_feats=(modality != "clinical"),
     )
     cfg["feat_path_col"] = feat_col
+    cfg["tme_cols"] = tme_cols
     cfg["n_classes"] = 2
 
     if modality == "clinical":
@@ -2669,7 +2830,8 @@ def main():
         f"患者数: {len(pt)}, pCR(1)={int((pt['y'] == 1).sum())}, "
         f"N-pCR(0)={int((pt['y'] == 0).sum())}, "
         f"modality={modality}, in_dim={cfg['in_dim']}, n_classes={cfg['n_classes']}, "
-        f"临床列: {clinical_cols}, fusion: {cfg.get('fusion_type', 'concat')}, "
+        f"临床列: {clinical_cols}, TME列数: {len(tme_cols)}, use_tme: {cfg.get('use_tme', False)}, "
+        f"fusion: {cfg.get('fusion_type', 'concat')}, "
         f"split_mode: {cfg.get('split_mode')}, "
         f"splits_path: {cfg.get('splits_path')}"
     )

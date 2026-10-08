@@ -12,7 +12,8 @@
 | [`MambaMIL/`](MambaMIL/) | vendored [MambaMIL](https://github.com/isyangshu/MambaMIL)（`mamba_mil` / `trans_mil` / `s4model`） |
 | [`requirements.txt`](requirements.txt) | 基础依赖 |
 | [`requirements_mamba.txt`](requirements_mamba.txt) / [`scripts/install_mamba.sh`](scripts/install_mamba.sh) | Mamba CUDA 扩展安装 |
-| [`example_dataset.csv`](example_dataset.csv) | 示例数据 |
+| [`example_dataset.csv`](example_dataset.csv) | 示例数据（仅临床列） |
+| [`tme-ceshi.csv`](../tme-ceshi.csv) | 带 TME 宽表特征的示例（与上表同结构 + 951 列 TME） |
 | [`Feature_dict.json`](Feature_dict.json) | 字段说明 |
 
 核心约定：
@@ -73,6 +74,22 @@ python main_pcr_infer.py \
 | `Age` / `ER` / `PR` / `Ki67` | 连续 | 标准化 | 年龄与免疫组化 |
 
 一个 `case_id` 可对应多行（多张 slide）；训练时按患者拼 bag，超过 `--max_slides_train` 则随机采样；验证/推理拼接全部 slide。
+
+### TME 特征（可选）
+
+宽表 CSV（如 `tme-ceshi.csv`）在 clinical 列之后追加大量 TME 数值列（列名通常含 `||`）。
+除 `case_id/slide_id/slide_feats_path/label` 与临床白名单外的列均视为 TME。
+
+- 缺失值 **NA 按 0** 处理后再标准化
+- 同一患者多张 slide 时，TME 在病例内 **取均值**
+- 训练加 **`--use_tme`**：TME 与临床 one-hot/标准化向量 **拼接**，再与 MIL 表征做中期融合（`--fusion_type concat/bilinear/gated`）
+- 也可 `--modality pathology --use_tme`：仅 WSI + TME，不含临床
+
+```bash
+python make_kfold_splits.py --csv_path ../tme-ceshi.csv --out_dir ./splits/tme_k5 --k 5
+python main_pcr_train.py --split_mode kfold --splits_path ./splits/tme_k5 \
+    --use_tme --log_root ./logs --exp_name pcr_pathomic_tme
+```
 
 ---
 

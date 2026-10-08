@@ -114,16 +114,18 @@ def load_train_config(log_dir, config_override=None):
 
 
 def load_encoder_for_dir(model_dir, cfg):
-    """按需加载 clinical_encoder.json；pathology 模式返回 None。"""
+    """按需加载 clinical_encoder.json（含可选 TME 部分）。"""
     modality = T.normalize_modality(cfg)
+    use_tme = bool(cfg.get("use_tme", False))
     enc_path = os.path.join(model_dir, "clinical_encoder.json")
-    if modality in ("pathomic", "clinical"):
-        if os.path.isfile(enc_path):
-            return T.load_clinical_encoder(enc_path)
-        if modality == "clinical":
-            raise FileNotFoundError(f"clinical 推理需要 {enc_path}")
-        print(f"警告: 未找到 {enc_path}，该模型将不使用临床特征")
+    need_encoder = modality in ("pathomic", "clinical") or use_tme
+    if not need_encoder:
         return None
+    if os.path.isfile(enc_path):
+        return T.load_clinical_encoder(enc_path)
+    if modality == "clinical" or use_tme:
+        raise FileNotFoundError(f"推理需要 {enc_path}")
+    print(f"警告: 未找到 {enc_path}，该模型将不使用临床/TME 特征")
     return None
 
 
@@ -136,7 +138,7 @@ def maybe_disable_clinical(cfg, encoder):
         return cfg, encoder
     if modality == "clinical":
         raise FileNotFoundError("clinical 推理需要 clinical_encoder.json")
-    if modality == "pathomic":
+    if modality == "pathomic" and not cfg.get("use_tme", False):
         print("警告: 未找到 clinical_encoder，降级为 pathology 推理")
         cfg = dict(cfg)
         cfg["modality"] = "pathology"
@@ -150,12 +152,13 @@ def prepare_patient_table(cfg, csv_path):
     """读取 CSV → 患者表；必要时自动推断 in_dim。"""
     modality = T.normalize_modality(cfg)
     df = T.read_csv_smart(csv_path)
-    pt, clinical_cols, feat_col = T.build_patient_table(
+    pt, clinical_cols, feat_col, tme_cols = T.build_patient_table(
         df,
         label_col=cfg.get("label_col", "label"),
         feat_path_col=cfg.get("feat_path_col"),
         require_feats=(modality != "clinical"),
     )
+    cfg["tme_cols"] = tme_cols
     if feat_col is not None:
         cfg["feat_path_col"] = feat_col
     if modality == "clinical":
@@ -165,7 +168,7 @@ def prepare_patient_table(cfg, csv_path):
         cfg["in_dim"] = T.detect_in_dim(all_paths, cfg.get("feat_key", "features"))
     print(
         f"推理样本: n={len(pt)}, modality={modality}, in_dim={cfg.get('in_dim')}, "
-        f"临床列={clinical_cols}"
+        f"临床列={clinical_cols}, TME列数={len(tme_cols)}, use_tme={cfg.get('use_tme', False)}"
     )
     return pt
 
