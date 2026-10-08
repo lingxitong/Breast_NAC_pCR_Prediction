@@ -10,5 +10,6 @@
     "ER": "ER（连续变量，%或评分）",
     "PR": "PR（连续变量，%或评分）",
     "HER2": "HER2 IHC评分（因子变量，如0/1/2/3；与Molecular取值HER2含义不同）",
-    "Ki67": "Ki67（连续变量，%）"
+    "Ki67": "Ki67（连续变量，%）",
+    "TME_columns": "完整名单见 example_dataset.csv 第13列至末列，共951列，与 tme-ceshi.csv 表头一致；--use_tme 时参与融合，NA 按 0"
 }

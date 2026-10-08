@@ -12,13 +12,14 @@
 | [`MambaMIL/`](MambaMIL/) | vendored [MambaMIL](https://github.com/isyangshu/MambaMIL)（`mamba_mil` / `trans_mil` / `s4model`） |
 | [`requirements.txt`](requirements.txt) | 基础依赖 |
 | [`requirements_mamba.txt`](requirements_mamba.txt) / [`scripts/install_mamba.sh`](scripts/install_mamba.sh) | Mamba CUDA 扩展安装 |
-| [`example_dataset.csv`](example_dataset.csv) | 示例数据（仅临床列） |
-| [`tme-ceshi.csv`](../tme-ceshi.csv) | 带 TME 宽表特征的示例（与上表同结构 + 951 列 TME） |
-| [`Feature_dict.json`](Feature_dict.json) | 字段说明 |
+| [`example_dataset.csv`](example_dataset.csv) | 示例数据：100 张 slide + **完整 951 列 TME 表头**（TME 单元格为 `NA`） |
+| [`tme-ceshi.csv`](../tme-ceshi.csv) | 同列名的实测宽表（TME 为数值） |
+| [`Feature_dict.json`](Feature_dict.json) | 基础字段说明 |
 
 核心约定：
 - **标签**：`N-pCR → 0`，`pCR → 1`
 - **模态**：`pathomic`（病理+临床，默认）/ `pathology`（仅病理）/ `clinical`（仅临床）
+- **TME（可选）**：`--use_tme` 时拼接 TME 数值列；缺失 **NA 按 0**；不加该开关时 TME 列会被忽略
 - **划分**：须先跑 `make_kfold_splits.py` 或 `make_kfold_splits_and_test.py`；训练只认 `--splits_path`，CSV 从划分文件 `meta.csv_path` 读取
 - **临床编码**：因子 `Molecular,T,N,HER2` one-hot；连续 `Age,ER,PR,Ki67` 标准化  
   Molecular 四种：`HR+HER2-` / `HR+HER2+` / `TNBC` / `HER2`
@@ -52,7 +53,12 @@ python main_pcr_infer.py \
 
 ## 一、输入数据格式
 
-见 [`example_dataset.csv`](example_dataset.csv)。
+CSV 为 **一行一张 slide**。列顺序建议：必需列 → 临床列 → TME 数值列（可任意宽）。
+
+| 文件 | 用途 |
+| --- | --- |
+| [`example_dataset.csv`](example_dataset.csv) | 100 张 slide。列与正式宽表一致：**12 列基础字段 + 全部 951 个 TME 列名**。TME 单元格写成 `NA`，只用来对照特征名；`--use_tme` 时 NA 按 0 |
+| [`tme-ceshi.csv`](../tme-ceshi.csv) | 列名与 example 相同，TME 为实测数值 |
 
 ### 必需列
 
@@ -63,33 +69,29 @@ python main_pcr_infer.py \
 | `slide_feats_path` | 切片特征路径（`.pt` / `.h5`）；**仅临床模式可不依赖特征文件存在** |
 | `label` | `N-pCR` / `pCR`，或 `0` / `1` |
 
-`.pt` 可为 `float32` tensor，形状 `[N_patch, dim]`；也可为含 `features` 键的 dict。
+`.pt` 可为 `float32` tensor，形状 `[N_patch, dim]`；也可为含 `features` 键的 dict。`.h5` 默认读取 `features` 数据集。
 
-### 临床列
+### 临床列（pathomic / clinical 使用）
 
 | 列名 | 类型 | 编码 | 说明 |
 | --- | --- | --- | --- |
 | `Molecular` | 因子 | one-hot | `HR+HER2-` / `HR+HER2+` / `TNBC` / `HER2` |
 | `T` / `N` / `HER2` | 因子 | one-hot | 分期 / IHC（列名 `HER2` ≠ Molecular 取值 `HER2`） |
-| `Age` / `ER` / `PR` / `Ki67` | 连续 | 标准化 | 年龄与免疫组化 |
+| `Age` / `ER` / `PR` / `Ki67` | 连续 | 标准化 | 年龄与免疫组化；连续列缺失按训练集均值填补 |
+
+### TME 列（`--use_tme` 时使用）
+
+| 规则 | 说明 |
+| --- | --- |
+| 列识别 | 除必需列、临床白名单外的列均为 TME。完整名单就是 `example_dataset.csv` 第 13 列到最后一列，共 **951** 列，与 `tme-ceshi.csv` 表头一致 |
+| 首列 / 末列 | `GlobalRoiBasedFeatures||Saliency.TissueRatio` … `SparkFeatureSummary||SPARK__cfdv0gog3b7l_GRADIENT_R2` |
+| 缺失 | 单元格 **NA / 空** 编码时 **按 0**。example 里的 TME 全是 `NA`，正式训练请换填了数值的宽表 |
+| 多 slide | 同一 `case_id` 多行时，TME 在病例内 **取均值** 后再 z-score |
+| 忽略 | 未加 `--use_tme` 时，TME 列不参与训练 |
+
+### 患者与 bag
 
 一个 `case_id` 可对应多行（多张 slide）；训练时按患者拼 bag，超过 `--max_slides_train` 则随机采样；验证/推理拼接全部 slide。
-
-### TME 特征（可选）
-
-宽表 CSV（如 `tme-ceshi.csv`）在 clinical 列之后追加大量 TME 数值列（列名通常含 `||`）。
-除 `case_id/slide_id/slide_feats_path/label` 与临床白名单外的列均视为 TME。
-
-- 缺失值 **NA 按 0** 处理后再标准化
-- 同一患者多张 slide 时，TME 在病例内 **取均值**
-- 训练加 **`--use_tme`**：TME 与临床 one-hot/标准化向量 **拼接**，再与 MIL 表征做中期融合（`--fusion_type concat/bilinear/gated`）
-- 也可 `--modality pathology --use_tme`：仅 WSI + TME，不含临床
-
-```bash
-python make_kfold_splits.py --csv_path ../tme-ceshi.csv --out_dir ./splits/tme_k5 --k 5
-python main_pcr_train.py --split_mode kfold --splits_path ./splits/tme_k5 \
-    --use_tme --log_root ./logs --exp_name pcr_pathomic_tme
-```
 
 ---
 
@@ -187,6 +189,24 @@ python main_pcr_train.py --split_mode kfold --clinical_only \
     --splits_path ./splits/mol_label_k5 \
     --log_root ./logs --exp_name pcr_clinical
 
+# 病理 + 临床 + TME（example_dataset.csv 含完整 951 列 TME 表头，值为 NA）
+python make_kfold_splits.py --csv_path example_dataset.csv \
+    --out_dir ./splits/example_tme_k5 --k 5 --stratify_by Molecular_label
+python main_pcr_train.py --split_mode kfold \
+    --splits_path ./splits/example_tme_k5 \
+    --use_tme --log_root ./logs --exp_name pcr_pathomic_tme
+
+# 全量 TME 宽表（约 951 列）
+python make_kfold_splits.py --csv_path ../tme-ceshi.csv \
+    --out_dir ./splits/tme_k5 --k 5 --stratify_by Molecular_label
+python main_pcr_train.py --split_mode kfold --splits_path ./splits/tme_k5 \
+    --use_tme --log_root ./logs --exp_name pcr_tme_full
+
+# 仅病理 + TME（不含临床）
+python main_pcr_train.py --split_mode kfold --modality pathology --use_tme \
+    --splits_path ./splits/tme_k5 \
+    --log_root ./logs --exp_name pcr_path_tme
+
 # 亚组专训（例如 TNBC）
 python main_pcr_train.py --split_mode kfold \
     --splits_path ./splits/mol_label_k5/molecular_subgroups/TNBC \
@@ -215,20 +235,25 @@ python main_pcr_train.py --split_mode all_train \
 
 | `--modality` | 别名 | 说明 |
 | --- | --- | --- |
-| `pathomic` | 默认 | WSI MIL + 临床中期融合 |
-| `pathology` | `--no-use_clinical` | 仅病理 |
-| `clinical` | `--clinical_only` | 仅临床 MLP，不加载 WSI |
+| `pathomic` | 默认 | WSI MIL + 临床（+ 可选 TME）中期融合 |
+| `pathology` | `--no-use_clinical` | 仅病理；加 `--use_tme` 时为 WSI + TME |
+| `clinical` | `--clinical_only` | 临床（+ 可选 TME）MLP，不加载 WSI |
+
+| 开关 | 说明 |
+| --- | --- |
+| `--use_tme` | 将 TME 与临床向量 **拼接** 为一条辅助向量（维度写入 `clinical_in_dim` / `tme_in_dim`） |
+| `--no-use_tme` | 默认；忽略 CSV 中的 TME 列 |
 
 ```
-# pathomic
+# pathomic（+ 可选 TME，与临床拼接后同一 MLP）
 slide bag → MIL → 全局表征 ─┐
-临床向量 → MLP → 临床嵌入 ─┴→ fusion → 分类头
+[临床; TME] → MLP → 辅助嵌入 ─┴→ fusion → 分类头
 
-# clinical
-临床向量 → MLP → logits
+# clinical（+ 可选 TME）
+[临床; TME] → MLP → logits
 ```
 
-`--fusion_type`：`concat` / `bilinear` / `gated`（仅 pathomic）
+`--fusion_type`：`concat` / `bilinear` / `gated`（pathomic，以及 `pathology --use_tme`）
 
 `mamba_mil` / `trans_mil` / `s4model` 同样可作为 MIL backbone 接临床中期融合（内部表征维固定 512）。源码已 vendored 于 [`MambaMIL/`](MambaMIL/)；首次使用前需编译安装 CUDA 扩展：
 
@@ -264,8 +289,9 @@ pip install einops torch_geometric   # amd / wikg+gdf
 | `--splits_path` | **必填** | 预划分 yaml/json 或目录 |
 | `--split_mode` | `kfold` | `kfold` / `all_train` |
 | `--modality` | `pathomic` | 见上表 |
+| `--use_tme` | 关 | 是否融合 TME 宽表特征 |
 | `--model_type` | `abmil` | 见上表（含 amd/wikg/gdf） |
-| `--fusion_type` | `concat` | 中期融合 |
+| `--fusion_type` | `concat` | MIL 与辅助向量的中期融合 |
 | `--max_epochs` | `50` | 最大轮数 |
 | `--lr` | `1e-4` | 学习率 |
 | `--gc` | `16` | 梯度累积 |
@@ -288,7 +314,7 @@ logs/exp_name/
     split.yaml
     checkpoint_best.pt
     checkpoint_last.pt
-    clinical_encoder.json     # pathomic / clinical 时有
+    clinical_encoder.json     # pathomic / clinical / use_tme 时有（含临床+TME 编码）
     metrics.csv               # 含完整 train_/val_ 指标列
     early_stop.json
     val_predictions.csv
